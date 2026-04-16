@@ -8,4 +8,4 @@ aiohttp==3.9.1
 requests==2.31.0
 cerebras-cloud-sdk==1.67.0
 tavily-python==0.3.1
-firecrawl-py==0.0.37
+firecrawl-py==4.22.2

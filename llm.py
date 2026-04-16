@@ -164,7 +164,7 @@ class LLMPipeline:
     def _load_node_catalog(self) -> str:
         """Load full schema context from disk for Cypher generation."""
         env_path = os.getenv("SCHEMA_CONTEXT_PATH")
-        default_path = Path(__file__).resolve().parent.parent / "SCHEMA_CONTEXT_FOR_LLM.md"
+        default_path = Path(__file__).resolve().parent / "SCHEMA_CONTEXT_FOR_LLM.md"
         schema_path = Path(env_path) if env_path else default_path
 
         try:
