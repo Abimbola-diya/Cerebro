@@ -1,0 +1,70 @@
+# -------------------------------------------------
+# Secrets and environment configuration
+# -------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# Common secret files
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# -------------------------------------------------
+# Python bytecode and caches
+# -------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# -------------------------------------------------
+# Virtual environments and local Python tooling
+# -------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# Build/distribution artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -------------------------------------------------
+# Logs, runtime artifacts, and reports
+# -------------------------------------------------
+*.log
+logs/
+server.log
+
+# Generated robustness outputs
+robustness_test_report.json
+robustness_test_report_*.json
+
+# -------------------------------------------------
+# IDE/editor and OS files
+# -------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+.DS_Store
+Thumbs.db
+desktop.ini

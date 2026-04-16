@@ -1,0 +1,11 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+neo4j==5.14.1
+azure-ai-inference==1.0.0b3
+python-dotenv==1.0.0
+pydantic==2.5.0
+aiohttp==3.9.1
+requests==2.31.0
+cerebras-cloud-sdk==1.67.0
+tavily-python==0.3.1
+firecrawl-py==0.0.37

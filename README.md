@@ -1,3 +1,223 @@
+<<<<<<< HEAD
+# Cerebro AI Pipeline - MVP Backend
+
+## Overview
+
+FastAPI backend implementing the 7-step LLM query pipeline for Nigerian upstream oil & gas data.
+
+
+## Architecture
+
+```
+User Query → FastAPI → 7-Step Pipeline → Answer
+                ↓
+        Neo4j Database (Query A, B, C)
+                ↓
+        GitHub Models LLM (Synthesis)
+```
+
+### 7-Step Pipeline (from LLM_QUERY_PIPELINE_GUIDE.md)
+
+1. Load node catalog
+2. Identify entity type (UpstreamProducer, FPSOOperator, etc.)
+3. Query all entities (Query A)
+4. Disambiguate/match entity (consider session context)
+5. Discover properties (Query B)
+6. Filter by relevance
+7. Retrieve data & synthesize answer (Query C)
+
+## Setup
+
+### 1. Install Dependencies
+
+```bash
+cd cerebro_backend
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Configure Environment
+
+The `.env` file is already configured with:
+
+**⚠️ Security Note**: Keep `.env` secret. Never commit to git.
+
+### 3. Run Server
+
+```bash
+python main.py
+```
+
+Server starts at: `http://localhost:8000`
+
+API Docs (interactive): `http://localhost:8000/docs`
+
+## Endpoints
+
+### POST `/api/ask`
+Main endpoint - Answer questions about upstream producers
+
+**Request:**
+```json
+{
+  "query": "Tell me about Shell",
+  "session_id": "optional-uuid"
+}
+```
+
+**Response:**
+```json
+{
+  "answer": "Shell operates in Nigeria through SPDC (Shell Petroleum Development Company)...",
+  "entity_id": "shell-spdc",
+  "entity_name": "Shell SPDC",
+  "session_id": "uuid",
+  "is_success": true
+}
+```
+
+### GET `/api/entities`
+List all entities (with optional type filter)
+
+```bash
+curl http://localhost:8000/api/entities?entity_type=UpstreamProducer
+```
+
+### GET `/api/search`
+Search entities by keyword
+
+```bash
+curl "http://localhost:8000/api/search?query=Shell"
+```
+
+### GET `/api/entity/{entity_id}`
+Get entity details and available properties
+
+```bash
+curl http://localhost:8000/api/entity/shell-spdc
+```
+
+### GET `/api/session/{session_id}`
+Get session history and context
+
+### DELETE `/api/session/{session_id}`
+Clear session
+
+### GET `/health`
+Health check - verify all services
+
+### GET `/api/test`
+Test the pipeline with a sample query
+
+## Testing the Pipeline
+
+### Test 1: Simple Entity Query
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Tell me about Shell"}'
+```
+
+### Test 2: Follow-up Question (Session Memory)
+```bash
+# Get session_id from Test 1
+SESSION_ID="your-session-id"
+
+# Ask follow-up
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"query\":\"What is their production?\",\"session_id\":\"$SESSION_ID\"}"
+```
+
+### Test 3: List All Entities
+```bash
+curl http://localhost:8000/api/entities
+```
+
+### Test 4: Health Check
+```bash
+curl http://localhost:8000/health
+```
+
+### Test 5: Run Integrated Test
+```bash
+curl http://localhost:8000/api/test
+```
+
+## File Structure
+
+```
+cerebro_backend/
+├── main.py              # FastAPI app + endpoints
+├── database.py          # Neo4j driver + Query A/B/C
+├── llm.py               # LLM pipeline (7 steps)
+├── session.py           # Session memory management
+├── requirements.txt     # Python dependencies
+├── .env                 # Configuration (secrets)
+├── .env.example         # Template (for git)
+└── README.md            # This file
+```
+
+## How It Works
+
+### Query Flow Example: "Tell me about Shell"
+
+1. **Step 1**: Load node catalog (UpstreamProducer, FPSOOperator, etc.)
+2. **Step 2**: Identify type → Keywords "about Shell" → Entity = UpstreamProducer
+3. **Step 3**: Query all UpstreamProducers → Get [{id, name}, ...]
+4. **Step 4**: Match "Shell" to entity → Find "shell-spdc" or similar
+5. **Step 5**: Discover properties on shell-spdc → {name, equity%, production, reserves, ...}
+6. **Step 6**: Filter by relevance → Keep: name, equity%, production, reserves, headquarters
+7. **Step 7**: Retrieve data → Get values for filtered properties → LLM synthesizes answer
+
+### Session Example: Follow-up Question
+
+```
+User: "Tell me about Shell"
+→ Pipeline finds entity: shell-spdc
+→ Session memory stores: {current_entity_id: "shell-spdc", current_entity_name: "Shell SPDC"}
+
+User: "What is their production?"
+→ Step 4 checks session context
+→ Uses stored entity: shell-spdc (no need to disambiguate)
+→ Filter for production-related properties
+→ Return production data
+```
+
+## Key Design Decisions
+
+### 1. Database-First Property Discovery
+
+### 2. Session Memory
+
+### 3. LLM Synthesis Only
+
+## Troubleshooting
+
+### "GITHUB_TOKEN not set"
+
+### "Failed to connect to Neo4j"
+
+### "Connection timeout"
+
+### Empty results from `/api/ask`
+
+## Next Steps
+
+1. **Local Testing** ✅ (currently here)
+2. **Seed entities to Neo4j** (run `neo4j_seeding.py` if not already done)
+3. **Frontend Integration** (connect Vercel Jarvis to `POST /api/ask`)
+4. **Deploy to Cloud** (Vercel, Railway, or similar)
+
+## Performance Notes
+
+
+**Total request time**: ~3-7 seconds per query
+
+## Future Enhancements
+
+=======
 # Cerebro
 Building the future.
 # Cerebro
@@ -77,3 +297,4 @@ This repository currently holds the product vision and documentation layer. Arch
 > *What valuable company is nobody building?*
 
 The honest answer is: a company that can predict systemic collapse before it collapses. Every great company is a conspiracy to change the world. Cerebro is that conspiracy — starting with the Nigerian petrochemical industry, with the ambition of eventually being the intelligence layer that any complex, interconnected industry in the world cannot afford to operate without.
+>>>>>>> c823570df9c5987e4c332b7d261fbf8d44beb66b
