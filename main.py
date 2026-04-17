@@ -40,11 +40,32 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# Add CORS middleware for frontend integration later
+# Add CORS middleware for frontend integration.
+def _parse_cors_origins() -> List[str]:
+    """Parse comma-separated origins from env (supports wildcard)."""
+    raw = os.getenv("CORS_ALLOWED_ORIGINS", "*").strip()
+    if not raw:
+        return ["*"]
+
+    origins = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    if not origins:
+        return ["*"]
+    if "*" in origins:
+        return ["*"]
+    return origins
+
+
+cors_allowed_origins = _parse_cors_origins()
+cors_allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "false").strip().lower() == "true"
+
+if cors_allowed_origins == ["*"] and cors_allow_credentials:
+    logger.warning("CORS_ALLOW_CREDENTIALS=true ignored when CORS_ALLOWED_ORIGINS=*; forcing false")
+    cors_allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Will restrict to frontend URL in production
-    allow_credentials=True,
+    allow_origins=cors_allowed_origins,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -132,6 +153,42 @@ async def health_check():
         "status": "ok",
         "database": "connected" if db.driver else "disconnected",
         "llm": "ready" if llm_pipeline else "unavailable"
+    }
+
+
+@app.get("/api/schema/debug")
+def schema_debug():
+    """Inspect active schema context used for Cypher generation."""
+    if not llm_pipeline:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM pipeline unavailable. Cannot inspect schema context.",
+        )
+
+    runtime_summary = ""
+    runtime_labels: List[str] = []
+    if db.driver:
+        try:
+            runtime_summary = db.get_schema_summary()
+            for line in runtime_summary.splitlines():
+                if line.startswith("## Label: "):
+                    runtime_labels.append(line.replace("## Label: ", "").split("(")[0].strip())
+        except Exception as exc:
+            logger.warning("Schema debug: runtime summary unavailable: %s", exc)
+
+    static_schema = llm_pipeline.node_catalog or ""
+    active_schema = llm_pipeline._active_schema_catalog()
+
+    return {
+        "llm_provider": llm_pipeline.provider,
+        "llm_model": llm_pipeline.model,
+        "database_connected": bool(db.driver),
+        "runtime_schema_introspection_enabled": llm_pipeline.runtime_schema_introspection_enabled,
+        "runtime_schema_chars": len(runtime_summary),
+        "static_schema_chars": len(static_schema),
+        "active_schema_chars": len(active_schema),
+        "runtime_labels_sample": runtime_labels[:20],
+        "runtime_schema_preview": runtime_summary[:2000],
     }
 
 @app.post("/api/ask", response_model=QueryResponse)

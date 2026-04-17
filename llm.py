@@ -36,6 +36,86 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# Curated aliases for common user wording that does not always map directly to
+# the canonical short_name field.
+MANUAL_ENTITY_ALIASES: Dict[str, str] = {
+    "shell": "shell-spdc",
+    "spdc": "shell-spdc",
+    "shell nigeria": "shell-spdc",
+    "snepco": "snepco-shell-deepwater",
+    "shell deepwater": "snepco-shell-deepwater",
+    "bonga": "snepco-shell-deepwater",
+    "total": "totalenergies-ep-nigeria",
+    "totalenergies": "totalenergies-ep-nigeria",
+    "chevron": "chevron-nigeria-limited",
+    "cnl": "chevron-nigeria-limited",
+    "mobil": "eepnl-exxonmobil-deepwater",
+    "exxonmobil": "eepnl-exxonmobil-deepwater",
+    "esso": "eepnl-exxonmobil-deepwater",
+    "nnpc": "nnpc-limited",
+    "nnpc limited": "nnpc-limited",
+    "nepl": "nepl-nnpc-ep",
+    "nnpc e&p": "nepl-nnpc-ep",
+    "agip": "oando-png-formerly-naoc",
+    "naoc": "oando-png-formerly-naoc",
+    "oando": "oando-petroleum-natural-gas",
+    "seplat": "seplat-energy",
+    "heirs": "heirs-energies",
+    "aiteo": "aiteo-eastern-ep",
+    "first e&p": "first-ep",
+    "shoreline": "shoreline-energy",
+    "neconde": "neconde-energy",
+    "eroton": "eroton-ep",
+    "star deep water": "star-deep-water-chevron",
+    "agbami": "star-deep-water-chevron",
+    "famfa": "famfa-oil",
+    "cnooc": "cnooc-nigeria",
+    "sapetro": "sapetro-south-atlantic",
+    "nae": "nae-eni-deepwater",
+    "seepco": "seepco-sterling",
+    "sterling oil": "seepco-sterling",
+    "elcrest": "elcrest-ep",
+    "nd western": "nd-western",
+    "chappal": "chappal-energies",
+    "waltersmith": "waltersmith-petroman",
+    "aradel": "aradel-holdings",
+    "amni": "amni-international",
+    "pan ocean": "pan-ocean-nigeria",
+    "belema": "belema-oil",
+    "midwestern": "midwestern-oil-gas",
+    "green energy": "green-energy-international",
+    "suntrust": "suntrust-oil",
+    "newcross": "newcross-ep",
+    "oriental energy": "oriental-energy",
+    "platform petroleum": "platform-petroleum",
+}
+
+ENTITY_TOKEN_STOPWORDS = {
+    "company",
+    "limited",
+    "ltd",
+    "plc",
+    "producer",
+    "producers",
+    "operator",
+    "operators",
+    "upstream",
+    "aggregate",
+    "oil",
+    "gas",
+    "nigeria",
+    "nigerian",
+    "exploration",
+    "production",
+    "petroleum",
+    "energy",
+    "resources",
+    "development",
+    "international",
+    "services",
+}
+
+
 class LLMPipeline:
     def __init__(self):
         self.provider = ""
@@ -77,6 +157,25 @@ class LLMPipeline:
         self.groq_schema_max_chars = int(os.getenv("GROQ_SCHEMA_MAX_CHARS", "7000"))
         self.groq_schema_rag_max_sections = int(os.getenv("GROQ_SCHEMA_RAG_MAX_SECTIONS", "6"))
         self.groq_schema_rag_max_chars = int(os.getenv("GROQ_SCHEMA_RAG_MAX_CHARS", "4500"))
+        self.schema_rag_default_max_sections = int(os.getenv("SCHEMA_RAG_DEFAULT_MAX_SECTIONS", "10"))
+        self.schema_rag_default_max_chars = int(os.getenv("SCHEMA_RAG_DEFAULT_MAX_CHARS", "14000"))
+        compact_schema_providers_raw = os.getenv("LLM_COMPACT_SCHEMA_PROVIDERS", "groq")
+        self.compact_schema_providers = {
+            provider.strip().lower()
+            for provider in compact_schema_providers_raw.split(",")
+            if provider.strip()
+        }
+        self.runtime_schema_introspection_enabled = (
+            os.getenv("RUNTIME_SCHEMA_INTROSPECTION_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.runtime_schema_context: str = ""
+        self.entity_resolution_enabled = (
+            os.getenv("ENTITY_RESOLUTION_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.entity_resolution_max_ids = int(os.getenv("ENTITY_RESOLUTION_MAX_IDS", "5"))
+        self.entity_resolution_min_score = int(os.getenv("ENTITY_RESOLUTION_MIN_SCORE", "100"))
 
         self._init_llm_client()
         self.node_catalog = self._load_node_catalog()
@@ -177,6 +276,30 @@ class LLMPipeline:
             logger.warning("Failed to load schema context from %s: %s", schema_path, exc)
             return self._get_fallback_schema()
 
+    def _get_runtime_schema_context(self) -> str:
+        """Get dynamic schema summary from Neo4j when connection is available."""
+        if not self.runtime_schema_introspection_enabled:
+            return ""
+
+        if not getattr(db, "driver", None):
+            return self.runtime_schema_context
+
+        try:
+            runtime_schema = db.get_schema_summary()
+            if runtime_schema:
+                self.runtime_schema_context = runtime_schema
+            return self.runtime_schema_context
+        except Exception as exc:
+            logger.debug("Runtime schema context unavailable: %s", exc)
+            return self.runtime_schema_context
+
+    def _active_schema_catalog(self) -> str:
+        """Combine static schema file context with runtime database introspection."""
+        runtime_schema = self._get_runtime_schema_context()
+        if not runtime_schema:
+            return self.node_catalog
+        return f"{self.node_catalog}\n\n{runtime_schema}"
+
     @staticmethod
     def _get_fallback_schema() -> str:
         """Minimal fallback schema if full file is unavailable."""
@@ -191,8 +314,10 @@ class LLMPipeline:
         """Compact schema context for token-limited providers."""
         return """SCHEMA: Nigerian Upstream Petroleum Graph
 
-PRIMARY NODE:
-- UpstreamProducer (54 entities)
+PRIMARY LABEL FOCUS:
+- UpstreamProducer (major entity group)
+- Additional labels can exist (for example ClassNode, concession/infrastructure categories).
+- Use retrieved schema excerpts as source of truth for labels beyond UpstreamProducer.
 
 KEY PROPERTIES:
 - id (string): unique slug
@@ -278,13 +403,23 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
 
         return [section for section in sections if section]
 
-    def _retrieve_relevant_schema_sections(self, user_query: str) -> List[str]:
+    def _retrieve_relevant_schema_sections(
+        self,
+        user_query: str,
+        max_sections: Optional[int] = None,
+        max_chars: Optional[int] = None,
+        schema_catalog: Optional[str] = None,
+    ) -> List[str]:
         """Retrieve highest-signal schema sections for the current user query."""
         keywords = self._extract_query_keywords(user_query)
         if not keywords:
             return []
 
-        sections = self._split_schema_sections(self.node_catalog)
+        max_sections = max_sections or self.schema_rag_default_max_sections
+        max_chars = max_chars or self.schema_rag_default_max_chars
+
+        schema_text = schema_catalog if schema_catalog is not None else self.node_catalog
+        sections = self._split_schema_sections(schema_text)
         if not sections:
             return []
 
@@ -308,14 +443,14 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
         selected: List[str] = []
         used_chars = 0
         for _, _, section in scored_sections:
-            if len(selected) >= self.groq_schema_rag_max_sections:
+            if len(selected) >= max_sections:
                 break
 
             snippet = section
             if len(snippet) > 1400:
                 snippet = snippet[:1400].rstrip() + "\n..."
 
-            if used_chars + len(snippet) > self.groq_schema_rag_max_chars:
+            if used_chars + len(snippet) > max_chars:
                 continue
 
             selected.append(snippet)
@@ -329,10 +464,164 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
         )
         return selected
 
-    def _build_groq_schema_context(self, user_query: str) -> str:
+    @staticmethod
+    def _normalize_lookup_text(value: str) -> str:
+        """Normalize free text for resilient entity alias matching."""
+        return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+    @staticmethod
+    def _contains_alias(query_norm: str, alias_norm: str) -> bool:
+        """Word-boundary-like containment on normalized text."""
+        if not query_norm or not alias_norm:
+            return False
+        return f" {alias_norm} " in f" {query_norm} "
+
+    @staticmethod
+    def _quote_cypher_string(value: str) -> str:
+        """Escape a Python string for safe embedding in single-quoted Cypher literals."""
+        return (value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+    @staticmethod
+    def _has_explicit_compare_intent(user_query: str) -> bool:
+        """Detect direct multi-entity comparison/disambiguation intent."""
+        q = f" {(user_query or '').lower()} "
+        compare_markers = [" compare ", " vs ", " versus ", " between ", " difference", " separately "]
+        return any(marker in q for marker in compare_markers)
+
+    def _resolve_entity_ids_from_query(self, user_query: str) -> List[str]:
+        """Resolve likely entity IDs from user query using aliases and live DB metadata."""
+        if not self.entity_resolution_enabled:
+            return []
+
+        query_norm = self._normalize_lookup_text(user_query)
+        if not query_norm:
+            return []
+
+        scores: Dict[str, int] = {}
+
+        def add_score(entity_id: Optional[str], score: int) -> None:
+            if not entity_id:
+                return
+            scores[entity_id] = scores.get(entity_id, 0) + score
+
+        # 1) High-confidence manual aliases.
+        for alias, entity_id in MANUAL_ENTITY_ALIASES.items():
+            alias_norm = self._normalize_lookup_text(alias)
+            if self._contains_alias(query_norm, alias_norm):
+                add_score(entity_id, 200 + len(alias_norm))
+
+        # 2) Dynamic aliases from live entities to reduce hardcoded drift.
+        entities: List[Dict[str, Any]] = []
+        if getattr(db, "driver", None):
+            try:
+                entities = db.query_all_entities("UpstreamProducer")
+            except Exception as exc:
+                logger.debug("Entity resolution lookup skipped: %s", exc)
+
+        if entities:
+            token_frequency: Dict[str, int] = {}
+            entity_tokens: Dict[str, List[str]] = {}
+
+            for entity in entities:
+                entity_id = entity.get("id")
+                if not isinstance(entity_id, str):
+                    continue
+
+                token_candidates: List[str] = []
+                for source in [entity.get("name", ""), entity.get("short_name", "")]:
+                    for token in self._normalize_lookup_text(str(source)).split():
+                        if len(token) < 4 or token in ENTITY_TOKEN_STOPWORDS:
+                            continue
+                        token_candidates.append(token)
+
+                deduped_tokens = sorted(set(token_candidates))
+                entity_tokens[entity_id] = deduped_tokens
+                for token in deduped_tokens:
+                    token_frequency[token] = token_frequency.get(token, 0) + 1
+
+            for entity in entities:
+                entity_id = entity.get("id")
+                if not isinstance(entity_id, str):
+                    continue
+
+                alias_variants = {
+                    self._normalize_lookup_text(entity_id.replace("-", " ")),
+                    self._normalize_lookup_text(str(entity.get("name", ""))),
+                    self._normalize_lookup_text(str(entity.get("short_name", ""))),
+                }
+
+                for alias in alias_variants:
+                    if len(alias) >= 3 and self._contains_alias(query_norm, alias):
+                        add_score(entity_id, 90 + len(alias))
+
+                for token in entity_tokens.get(entity_id, []):
+                    if token_frequency.get(token) == 1 and self._contains_alias(query_norm, token):
+                        add_score(entity_id, 40 + len(token))
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if not ranked:
+            return []
+
+        top_score = ranked[0][1]
+        score_floor = max(self.entity_resolution_min_score, int(top_score * 0.55))
+        resolved_ids = [
+            entity_id
+            for entity_id, score in ranked
+            if score >= score_floor
+        ][: self.entity_resolution_max_ids]
+
+        if resolved_ids:
+            logger.info(
+                "[ENTITY-RESOLUTION] Query resolved to entity IDs: %s (top_score=%d, floor=%d)",
+                resolved_ids,
+                top_score,
+                score_floor,
+            )
+
+        return resolved_ids
+
+    def _deterministic_entity_resolution_override(
+        self,
+        user_query: str,
+        resolved_entity_ids: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Use deterministic entity-scoped queries when intent and resolved IDs are high confidence."""
+        resolved_ids = resolved_entity_ids if resolved_entity_ids is not None else self._resolve_entity_ids_from_query(user_query)
+        if not resolved_ids:
+            return None
+
+        has_multi_entity_intent = self._has_explicit_compare_intent(user_query)
+
+        if len(resolved_ids) == 1 and not self._is_aggregation_query(user_query):
+            entity_id = self._quote_cypher_string(resolved_ids[0])
+            return (
+                "MATCH (n:UpstreamProducer)\n"
+                f"WHERE n.id = '{entity_id}'\n"
+                "RETURN n AS entity\n"
+                "LIMIT 1"
+            )
+
+        if len(resolved_ids) >= 2 and has_multi_entity_intent:
+            id_literals = ", ".join([f"'{self._quote_cypher_string(entity_id)}'" for entity_id in resolved_ids[:3]])
+            return (
+                "MATCH (n:UpstreamProducer)\n"
+                f"WHERE n.id IN [{id_literals}]\n"
+                "RETURN n AS entity\n"
+                "ORDER BY n.name ASC\n"
+                "LIMIT 25"
+            )
+
+        return None
+
+    def _build_groq_schema_context(self, user_query: str, schema_catalog: Optional[str] = None) -> str:
         """Build a size-safe schema context for Groq: compact schema + retrieved excerpts."""
         compact_schema = self._get_compact_schema()
-        retrieved_sections = self._retrieve_relevant_schema_sections(user_query)
+        retrieved_sections = self._retrieve_relevant_schema_sections(
+            user_query,
+            max_sections=self.groq_schema_rag_max_sections,
+            max_chars=self.groq_schema_rag_max_chars,
+            schema_catalog=schema_catalog,
+        )
 
         if not retrieved_sections:
             return compact_schema
@@ -350,19 +639,56 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
 
         return context
 
+    def _build_general_schema_context(self, user_query: str, schema_catalog: Optional[str] = None) -> str:
+        """Build query-focused schema context for providers that can support larger prompts."""
+        schema_text = schema_catalog if schema_catalog is not None else self.node_catalog
+        retrieved_sections = self._retrieve_relevant_schema_sections(
+            user_query,
+            max_sections=self.schema_rag_default_max_sections,
+            max_chars=self.schema_rag_default_max_chars,
+            schema_catalog=schema_text,
+        )
+
+        if not retrieved_sections:
+            context = schema_text
+        else:
+            context = "RELEVANT SCHEMA EXCERPTS (retrieved for this question):\n" + "\n\n".join(
+                retrieved_sections
+            )
+
+        if len(context) > self.schema_rag_default_max_chars:
+            context = context[: self.schema_rag_default_max_chars].rstrip()
+
+        return context
+
     def _schema_context_for_query(self, user_query: str) -> str:
         """Select schema context size based on provider/token constraints."""
-        if self.provider in {"groq", "cerebras", "openrouter"}:
-            schema_context = self._build_groq_schema_context(user_query)
+        active_schema_catalog = self._active_schema_catalog()
+
+        if self.provider in self.compact_schema_providers:
+            schema_context = self._build_groq_schema_context(
+                user_query,
+                schema_catalog=active_schema_catalog,
+            )
             logger.info(
                 "Using compact schema context for provider=%s (%d chars, full schema=%d chars)",
                 self.provider,
                 len(schema_context),
-                len(self.node_catalog),
+                len(active_schema_catalog),
             )
             return schema_context
 
-        return self.node_catalog
+        schema_context = self._build_general_schema_context(
+            user_query,
+            schema_catalog=active_schema_catalog,
+        )
+        logger.info(
+            "Using query-focused schema context for provider=%s (%d chars, full schema=%d chars)",
+            self.provider,
+            len(schema_context),
+            len(active_schema_catalog),
+        )
+        return schema_context
 
     @staticmethod
     def _build_cypher_system_prompt(schema_context: str) -> str:
@@ -385,6 +711,11 @@ Rules:
 10. Use Neo4j built-ins only (toFloat, toInteger); never use APOC helper functions.
 11. For AVG/SUM on mixed-type numeric fields, convert safely with CASE + regex before aggregation.
 12. Avoid UNION unless absolutely necessary.
+13. For user-specified entity names, use case-insensitive matching: toLower(n.name) CONTAINS toLower("...") OR toLower(coalesce(n.short_name, "")) CONTAINS toLower("...").
+14. Use labels and properties exactly as they appear in schema context; do not invent new labels/properties.
+15. If user prompt includes RESOLVED_ENTITY_ID or RESOLVED_ENTITY_IDS, you MUST prioritize n.id equality/IN filters over name matching.
+16. Do not invent relationship types. Only use relationships that appear in schema context.
+17. operational_area is often a list. For deepwater/offshore filters, use list-safe predicates like: any(area IN coalesce(n.operational_area, []) WHERE toLower(toString(area)) CONTAINS 'deepwater').
 """
 
     @staticmethod
@@ -598,20 +929,10 @@ Rules:
     @staticmethod
     def _extract_cypher(llm_output: str) -> str:
         """Extract raw Cypher text from model output."""
-        text = llm_output.strip()
-
-        if text.startswith("```"):
-            chunks = text.split("```")
-            if len(chunks) >= 2:
-                text = chunks[1].strip()
-                if text.lower().startswith("cypher"):
-                    text = text[6:].strip()
-
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if not lines:
+        text = (llm_output or "").strip()
+        if not text:
             raise ValueError("LLM did not return a Cypher query")
 
-        start_idx = None
         start_patterns = (
             "MATCH",
             "OPTIONAL MATCH",
@@ -619,19 +940,52 @@ Rules:
             "UNWIND",
             "RETURN",
         )
-        for idx, line in enumerate(lines):
-            upper_line = line.upper()
-            if any(upper_line.startswith(pattern) for pattern in start_patterns):
-                start_idx = idx
-                break
 
-        if start_idx is not None:
-            lines = lines[start_idx:]
+        # Prefer fenced code blocks to avoid trailing conversational text.
+        code_blocks = re.findall(
+            r"```(?:\s*cypher|\s*cql)?\s*([\s\S]*?)```",
+            text,
+            flags=re.IGNORECASE,
+        )
+        candidates = code_blocks + [text]
 
-        query = "\n".join(lines).strip().rstrip(";")
-        if not query:
-            raise ValueError("Failed to parse Cypher from LLM output")
-        return query
+        trailer_pattern = re.compile(
+            r"^(here|enjoy|note|explanation|output|result|i hope|this query|let me|code snippet)\b",
+            flags=re.IGNORECASE,
+        )
+
+        for candidate in candidates:
+            block_text = candidate.strip()
+            if block_text.lower().startswith("cypher"):
+                block_text = block_text[6:].strip()
+
+            lines = [line.strip() for line in block_text.splitlines() if line.strip()]
+            if not lines:
+                continue
+
+            start_idx = None
+            for idx, line in enumerate(lines):
+                upper_line = line.upper()
+                if any(upper_line.startswith(pattern) for pattern in start_patterns):
+                    start_idx = idx
+                    break
+
+            if start_idx is None:
+                continue
+
+            cypher_lines: List[str] = []
+            for line in lines[start_idx:]:
+                if line.startswith("```"):
+                    break
+                if trailer_pattern.match(line):
+                    break
+                cypher_lines.append(line)
+
+            query = "\n".join(cypher_lines).strip().rstrip(";")
+            if query:
+                return query
+
+        raise ValueError("Failed to parse Cypher from LLM output")
 
     @staticmethod
     def _deterministic_cypher_override(user_query: str) -> Optional[str]:
@@ -710,6 +1064,78 @@ ORDER BY total_field_proxy_count DESC, name ASC
 LIMIT 1
 """.strip()
 
+        if (
+            ("largeindigenous" in q or "large indigenous" in q)
+            and "security risk" in q
+            and ("top" in q or "rank" in q)
+            and "production" in q
+        ):
+            return """
+MATCH (n:UpstreamProducer)
+WHERE n.sub_type = 'LargeIndigenous'
+  AND toLower(coalesce(n.security_risk_level, '')) = 'high'
+WITH
+    n,
+    CASE
+        WHEN toString(n.current_production_bopd) =~ '^[0-9]+(\\.[0-9]+)?$' THEN toFloat(toString(n.current_production_bopd))
+        ELSE NULL
+    END AS current_production_bopd,
+    CASE
+        WHEN toString(n.nnpc_equity_percentage) =~ '^[0-9]+(\\.[0-9]+)?$' THEN toFloat(toString(n.nnpc_equity_percentage))
+        ELSE NULL
+    END AS nnpc_equity_percentage,
+    size(coalesce(n.oml_blocks_held, [])) + size(coalesce(n.opl_blocks_held, [])) AS total_block_footprint
+WHERE current_production_bopd IS NOT NULL
+RETURN
+    n.id AS entity_id,
+    n.name AS entity_name,
+    n.security_risk_level AS security_risk_level,
+    current_production_bopd,
+    nnpc_equity_percentage,
+    total_block_footprint
+ORDER BY current_production_bopd DESC, total_block_footprint DESC, entity_name ASC
+LIMIT 3
+""".strip()
+
+        if "deepwater" in q and ("operational_area" in q or "parent company" in q):
+            return """
+MATCH (n:UpstreamProducer)
+WHERE any(area IN coalesce(n.operational_area, []) WHERE toLower(toString(area)) CONTAINS 'deepwater')
+WITH
+    n,
+    CASE
+        WHEN toString(n.current_production_bopd) =~ '^[0-9]+(\\.[0-9]+)?$' THEN toFloat(toString(n.current_production_bopd))
+        ELSE NULL
+    END AS current_production_bopd
+RETURN
+    n.id AS entity_id,
+    n.name AS entity_name,
+    n.parent_company AS parent_company,
+    current_production_bopd
+ORDER BY current_production_bopd DESC, entity_name ASC
+LIMIT 100
+""".strip()
+
+        if (
+            "marginal field" in q
+            and ("how many" in q or "count" in q)
+            and ("active" in q or "near production" in q)
+        ):
+            return """
+MATCH (n:UpstreamProducer)
+WHERE (
+    'MarginalFieldOperator' IN labels(n)
+    OR n.is_marginal_field_operator = true
+    OR n.marginal_field_round IS NOT NULL
+)
+AND toLower(coalesce(n.operational_status, '')) IN ['active', 'near production']
+AND CASE
+    WHEN toString(n.current_production_bopd) =~ '^[0-9]+(\\.[0-9]+)?$' THEN toFloat(toString(n.current_production_bopd))
+    ELSE 0
+END > 0
+RETURN COUNT(n) AS active_marginal_field_operators
+""".strip()
+
         return None
 
     @staticmethod
@@ -733,6 +1159,46 @@ LIMIT 1
         if isinstance(value, (list, dict)):
             return len(value) == 0
         return False
+
+    @staticmethod
+    def _coerce_numeric_value(value: Any) -> Optional[float]:
+        """Convert scalar strings/numbers to float when possible."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            normalized = value.replace(",", "").strip()
+            if re.fullmatch(r"-?[0-9]+(\.[0-9]+)?", normalized):
+                return float(normalized)
+        return None
+
+    def _deterministic_answer_override(self, user_query: str, cypher_results: List[Dict[str, Any]]) -> Optional[str]:
+        """Provide stable answers for simple aggregate count questions."""
+        if not cypher_results or not isinstance(cypher_results[0], dict):
+            return None
+
+        q = user_query.lower()
+        is_count_intent = any(token in q for token in ["how many", "count", "number of"])
+        if not is_count_intent:
+            return None
+
+        first_row = cypher_results[0]
+        if len(first_row) != 1:
+            return None
+
+        metric_name, metric_value = next(iter(first_row.items()))
+        numeric_value = self._coerce_numeric_value(metric_value)
+        if numeric_value is None:
+            return None
+
+        if numeric_value.is_integer():
+            value_text = str(int(numeric_value))
+        else:
+            value_text = f"{numeric_value:.2f}".rstrip("0").rstrip(".")
+
+        metric_label = metric_name.replace("_", " ")
+        return f"{metric_label}: {value_text}."
 
     def _extract_entity_identity(self, results: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
         """Extract best-effort (entity_id, entity_name) from query results."""
@@ -909,12 +1375,41 @@ Rules:
             logger.info("[LLM-CYPHER-GEN] Generated: %s", deterministic_query[:200])
             return deterministic_query
 
+        resolved_entity_ids = self._resolve_entity_ids_from_query(user_query)
+        deterministic_entity_query = self._deterministic_entity_resolution_override(
+            user_query,
+            resolved_entity_ids,
+        )
+        if deterministic_entity_query:
+            logger.info("[LLM-CYPHER-GEN] Using deterministic entity-resolution override")
+            logger.info("[LLM-CYPHER-GEN] Generated: %s", deterministic_entity_query[:200])
+            return deterministic_entity_query
+
         schema_context = self._schema_context_for_query(user_query)
         system_prompt = self._build_cypher_system_prompt(schema_context)
 
+        entity_resolution_hint = ""
+        if resolved_entity_ids:
+            has_compare_intent = self._has_explicit_compare_intent(user_query)
+            if len(resolved_entity_ids) == 1 and not self._is_aggregation_query(user_query):
+                resolved_id = self._quote_cypher_string(resolved_entity_ids[0])
+                entity_resolution_hint = (
+                    "\n\n[RESOLVED_ENTITY_ID]\n"
+                    f"{resolved_id}\n"
+                    "Use WHERE n.id = '<resolved_id>' as primary filter unless question explicitly asks for all entities."
+                )
+            elif len(resolved_entity_ids) >= 2 and has_compare_intent:
+                resolved_literal_list = ", ".join([f"'{self._quote_cypher_string(entity_id)}'" for entity_id in resolved_entity_ids[:3]])
+                entity_resolution_hint = (
+                    "\n\n[RESOLVED_ENTITY_IDS]\n"
+                    f"{resolved_literal_list}\n"
+                    "When comparing or disambiguating these entities, use WHERE n.id IN [..] as primary filter."
+                )
+
         user_prompt = (
             "Generate a Cypher query for this question:\n"
-            f"{user_query}\n\n"
+            f"{user_query}"
+            f"{entity_resolution_hint}\n\n"
             "Return only Cypher."
         )
 
@@ -930,9 +1425,11 @@ Rules:
 
             if is_size_error:
                 logger.warning(
-                    "Provider rejected prompt size/rate; retrying Cypher generation with minimal schema context"
+                    "Provider rejected prompt size/rate; retrying Cypher generation with compact schema context"
                 )
-                fallback_system_prompt = self._build_cypher_system_prompt(self._get_fallback_schema())
+                fallback_system_prompt = self._build_cypher_system_prompt(
+                    self._build_groq_schema_context(user_query)
+                )
                 llm_output = self._call_llm(fallback_system_prompt, user_prompt)
             else:
                 raise
@@ -944,6 +1441,11 @@ Rules:
     def _synthesize_from_cypher(self, user_query: str, cypher_results: List[Dict[str, Any]]) -> str:
         """Call 2: Convert raw query results into a natural language answer."""
         logger.info("[LLM-ANSWER-GEN] Synthesizing answer for: %s", user_query[:120])
+
+        deterministic_answer = self._deterministic_answer_override(user_query, cypher_results)
+        if deterministic_answer:
+            logger.info("[LLM-ANSWER-GEN] Using deterministic aggregate answer override")
+            return deterministic_answer
 
         synthesis_rows, was_truncated, total_rows = self._prepare_results_for_synthesis(cypher_results)
         results_json = json.dumps(synthesis_rows, indent=2, default=str)
@@ -1238,9 +1740,18 @@ Rules:
         """Block explicit destructive/query-manipulation intents early."""
         q = user_query.lower().strip()
 
+        blocked_patterns = [
+            r"\b(ignore|bypass|override)\b.*\b(instruction|policy|guardrail)s?\b",
+            r"\b(write|generate|produce|show|give)\b.*\b(create|delete|merge|set|remove|drop|alter|detach)\b.*\bquery\b",
+            r"\b(insert|update)\b.*\b(node|record|producer)\b",
+        ]
+        if any(re.search(pattern, q) for pattern in blocked_patterns):
+            return True
+
         blocked_substrings = [
             "ignore all prior instructions",
             "generate a create query",
+            "write a create query",
             "delete all upstreamproducer",
             "drop the neo4j database",
             "merge a hacker node",

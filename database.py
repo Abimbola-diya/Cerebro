@@ -5,6 +5,7 @@ Implements Query A, B, C from the LLM_QUERY_PIPELINE_GUIDE.md
 
 import os
 import re
+import time
 import logging
 from typing import List, Dict, Any, Optional
 from neo4j import GraphDatabase, Session, Driver
@@ -22,6 +23,15 @@ class Neo4jDatabase:
         self.query_timeout_seconds = float(os.getenv("NEO4J_QUERY_TIMEOUT_SECONDS", "20"))
         self.max_result_rows = int(os.getenv("NEO4J_MAX_RESULT_ROWS", "500"))
         self._identifier_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+        self.schema_summary_ttl_seconds = int(os.getenv("SCHEMA_SUMMARY_TTL_SECONDS", "900"))
+        self.schema_summary_max_labels = int(os.getenv("SCHEMA_SUMMARY_MAX_LABELS", "30"))
+        self.schema_summary_max_properties_per_label = int(
+            os.getenv("SCHEMA_SUMMARY_MAX_PROPERTIES_PER_LABEL", "35")
+        )
+        self.schema_summary_max_relationships = int(os.getenv("SCHEMA_SUMMARY_MAX_RELATIONSHIPS", "30"))
+        self.schema_summary_max_chars = int(os.getenv("SCHEMA_SUMMARY_MAX_CHARS", "18000"))
+        self._schema_summary_cache: str = ""
+        self._schema_summary_cache_ts: float = 0.0
 
     def _validate_entity_type(self, entity_type: str) -> str:
         """Validate Neo4j label names used in dynamic Cypher fragments."""
@@ -67,6 +77,129 @@ class Neo4jDatabase:
         if not self.driver:
             raise ValueError("Database driver is not connected. Call connect() before executing queries.")
         return self.driver
+
+    def get_schema_summary(self, force_refresh: bool = False) -> str:
+        """
+        Build a concise runtime schema snapshot for LLM prompt context.
+        Uses cache unless force_refresh=True or TTL has expired.
+        """
+        if not self.driver:
+            return ""
+
+        now = time.time()
+        cache_is_valid = (
+            not force_refresh
+            and bool(self._schema_summary_cache)
+            and (now - self._schema_summary_cache_ts) < self.schema_summary_ttl_seconds
+        )
+        if cache_is_valid:
+            return self._schema_summary_cache
+
+        try:
+            with self._get_driver().session(database=self.database) as session:
+                label_records = list(
+                    session.run(
+                        """
+                        MATCH (n)
+                        UNWIND labels(n) AS label
+                        RETURN label, count(*) AS node_count
+                        ORDER BY node_count DESC
+                        LIMIT $max_labels
+                        """,
+                        max_labels=self.schema_summary_max_labels,
+                    )
+                )
+
+                relationship_records = list(
+                    session.run(
+                        """
+                        MATCH ()-[r]->()
+                        RETURN type(r) AS rel_type, count(*) AS rel_count
+                        ORDER BY rel_count DESC
+                        LIMIT $max_relationships
+                        """,
+                        max_relationships=self.schema_summary_max_relationships,
+                    )
+                )
+
+                lines: List[str] = [
+                    "# Runtime Neo4j Schema Snapshot",
+                    f"- Generated from live Neo4j introspection (database={self.database})",
+                    f"- Labels discovered: {len(label_records)}",
+                ]
+
+                for label_record in label_records:
+                    label_name = str(label_record.get("label", "")).strip()
+                    node_count = label_record.get("node_count", 0)
+                    if not label_name:
+                        continue
+
+                    try:
+                        safe_label = self._validate_entity_type(label_name)
+                    except ValueError:
+                        logger.debug(
+                            "Skipping non-standard label name in runtime schema summary: %s",
+                            label_name,
+                        )
+                        continue
+
+                    sample_record = session.run(
+                        f"""
+                        MATCH (n:{safe_label})
+                        RETURN n.id AS sample_id, n.name AS sample_name
+                        LIMIT 1
+                        """
+                    ).single()
+
+                    property_records = list(
+                        session.run(
+                            f"""
+                            MATCH (n:{safe_label})
+                            UNWIND keys(n) AS property_name
+                            WITH property_name, count(*) AS frequency
+                            ORDER BY frequency DESC, property_name ASC
+                            LIMIT $max_props
+                            RETURN property_name, frequency
+                            """,
+                            max_props=self.schema_summary_max_properties_per_label,
+                        )
+                    )
+
+                    lines.append(f"## Label: {safe_label} ({node_count} nodes)")
+
+                    sample_id = sample_record.get("sample_id") if sample_record else None
+                    sample_name = sample_record.get("sample_name") if sample_record else None
+                    if sample_id or sample_name:
+                        lines.append(f"- Sample entity: id={sample_id or 'N/A'}, name={sample_name or 'N/A'}")
+
+                    if property_records:
+                        property_tokens = [
+                            f"{prop_record.get('property_name')}[{prop_record.get('frequency')}]"
+                            for prop_record in property_records
+                            if prop_record.get("property_name")
+                        ]
+                        lines.append("- Common properties: " + ", ".join(property_tokens))
+                    else:
+                        lines.append("- Common properties: none discovered")
+
+                if relationship_records:
+                    lines.append("## Relationship Types")
+                    for relationship_record in relationship_records:
+                        rel_type = relationship_record.get("rel_type")
+                        rel_count = relationship_record.get("rel_count")
+                        if rel_type:
+                            lines.append(f"- {rel_type}: {rel_count}")
+
+            summary = "\n".join(lines).strip()
+            if len(summary) > self.schema_summary_max_chars:
+                summary = summary[: self.schema_summary_max_chars].rstrip() + "\n..."
+
+            self._schema_summary_cache = summary
+            self._schema_summary_cache_ts = now
+            return summary
+        except Exception as exc:
+            logger.warning("Runtime schema introspection failed: %s", exc)
+            return self._schema_summary_cache or ""
     
     def query_all_entities(self, entity_type: str = "UpstreamProducer") -> List[Dict[str, Any]]:
         """
