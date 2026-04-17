@@ -8,6 +8,7 @@ from the current Neo4j producer dataset.
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -246,6 +247,7 @@ def evaluate_case(case: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any
 
 def main() -> None:
     schema_debug = call_schema_debug()
+    required_pass_rate = float(os.getenv("HARD_QUERY_REQUIRED_PASS_RATE", "95"))
 
     case_reports: List[Dict[str, Any]] = []
     for case in TEST_CASES:
@@ -255,6 +257,16 @@ def main() -> None:
 
     passed = sum(1 for item in case_reports if item["passed"])
     failed = len(case_reports) - passed
+    expected_security_case_ids = {
+        case["id"]
+        for case in TEST_CASES
+        if case.get("expect_security_block")
+    }
+    security_failures = [
+        item
+        for item in case_reports
+        if item["id"] in expected_security_case_ids and not item["passed"]
+    ]
 
     summary = {
         "base_url": BASE_URL,
@@ -262,6 +274,10 @@ def main() -> None:
         "passed": passed,
         "failed": failed,
         "pass_rate": round((passed / len(case_reports)) * 100, 2) if case_reports else 0.0,
+        "required_pass_rate": required_pass_rate,
+        "security_cases_total": len(expected_security_case_ids),
+        "security_cases_passed": len(expected_security_case_ids) - len(security_failures),
+        "has_security_regressions": len(security_failures) > 0,
         "schema_debug_status": schema_debug.get("http_status"),
         "schema_debug": schema_debug.get("body"),
     }
@@ -289,6 +305,14 @@ def main() -> None:
         print("None")
 
     print(f"\nReport written to: {output_path}")
+
+    pass_rate_ok = summary["pass_rate"] >= required_pass_rate
+    security_ok = len(security_failures) == 0
+    if not pass_rate_ok or not security_ok:
+        print("\nAcceptance gate failed.")
+        print(f"- pass_rate_ok={pass_rate_ok} (pass_rate={summary['pass_rate']}, required={required_pass_rate})")
+        print(f"- security_ok={security_ok} (security_failures={len(security_failures)})")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
