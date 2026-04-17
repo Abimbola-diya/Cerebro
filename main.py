@@ -24,6 +24,7 @@ import uvicorn
 
 from database import db
 from llm import llm_pipeline
+from keepalive import keepalive_service
 from session import session_manager
 
 # Configure logging
@@ -76,6 +77,7 @@ async def startup():
     print("🚀 Starting Cerebro Backend...")
     try:
         db.connect()
+        keepalive_service.start()
         print("✅ Backend ready")
     except Exception as e:
         print(f"❌ Startup failed: {e}")
@@ -83,6 +85,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     print("🛑 Shutting down...")
+    keepalive_service.stop()
     db.close()
 
 # --- Request/Response Models ---
@@ -189,6 +192,13 @@ def schema_debug():
         "active_schema_chars": len(active_schema),
         "runtime_labels_sample": runtime_labels[:20],
         "runtime_schema_preview": runtime_summary[:2000],
+        "langchain_shadow_enabled": llm_pipeline.langchain_cypher_shadow_enabled,
+        "langchain_shadow_ready": llm_pipeline.langchain_shadow_ready,
+        "langchain_shadow_provider": llm_pipeline.langchain_cypher_provider,
+        "langchain_shadow_model": llm_pipeline.langchain_openrouter_model,
+        "langchain_schema_source": llm_pipeline.langchain_schema_source,
+        "langchain_shadow_last_error": llm_pipeline.langchain_shadow_last_error,
+        "langchain_schema_chars": len(llm_pipeline._langchain_schema_cache or ""),
     }
 
 @app.post("/api/ask", response_model=QueryResponse)
@@ -370,6 +380,7 @@ def ask_question_debug(request: QueryRequest):
             "sources": result.get("sources", []),
             "used_web_enrichment": result.get("used_web_enrichment", False),
             "llm_provider": result.get("llm_provider"),
+            "langchain_shadow": result.get("langchain_shadow"),
             "duration_seconds": round(elapsed, 3),
         }
 

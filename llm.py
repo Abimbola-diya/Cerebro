@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 try:
-    import google.generativeai as genai
+    import google.generativeai as genai  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - optional provider dependency
     genai = None
 
@@ -28,6 +29,16 @@ try:
     from cerebras.cloud.sdk import Cerebras
 except Exception:  # pragma: no cover - optional provider dependency
     Cerebras = None
+
+try:
+    from langchain_community.graphs import Neo4jGraph
+except Exception:  # pragma: no cover - optional dependency
+    Neo4jGraph = None
+
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:  # pragma: no cover - optional dependency
+    ChatOpenAI = None
 
 from database import db
 from web_search import hybrid_searcher, synthesize_web_results
@@ -125,6 +136,15 @@ class LLMPipeline:
         self.web_enrichment_enabled = (
             os.getenv("WEB_ENRICHMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
         )
+        self.web_sources_for_synthesis = int(os.getenv("WEB_SOURCES_FOR_SYNTHESIS", "12"))
+        self.web_source_max_chars = int(os.getenv("WEB_SOURCE_MAX_CHARS", "2200"))
+        self.web_answer_max_chars = int(os.getenv("WEB_ANSWER_MAX_CHARS", "14000"))
+        self.web_priority_mode = os.getenv("WEB_PRIORITY_MODE", "balanced").strip().lower()
+        self.web_multi_model_enabled = (
+            os.getenv("WEB_MULTI_MODEL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        self.web_source_summary_provider = os.getenv("WEB_SOURCE_SUMMARY_PROVIDER", "auto").strip().lower()
+        self.web_final_synthesis_provider = os.getenv("WEB_FINAL_SYNTHESIS_PROVIDER", "auto").strip().lower()
 
         self.cerebras_api_key: Optional[str] = None
         self.cerebras_client: Any = None
@@ -176,9 +196,44 @@ class LLMPipeline:
         )
         self.entity_resolution_max_ids = int(os.getenv("ENTITY_RESOLUTION_MAX_IDS", "5"))
         self.entity_resolution_min_score = int(os.getenv("ENTITY_RESOLUTION_MIN_SCORE", "100"))
+        self.entity_resolution_alias_fuzzy_threshold = float(
+            os.getenv("ENTITY_RESOLUTION_ALIAS_FUZZY_THRESHOLD", "0.80")
+        )
+        self.entity_resolution_dynamic_fuzzy_threshold = float(
+            os.getenv("ENTITY_RESOLUTION_DYNAMIC_FUZZY_THRESHOLD", "0.84")
+        )
+        self.entity_resolution_token_fuzzy_threshold = float(
+            os.getenv("ENTITY_RESOLUTION_TOKEN_FUZZY_THRESHOLD", "0.82")
+        )
+
+        self.langchain_cypher_shadow_enabled = (
+            os.getenv("LANGCHAIN_CYPHER_SHADOW_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.langchain_cypher_provider = os.getenv("LANGCHAIN_CYPHER_PROVIDER", "openrouter").strip().lower()
+        self.langchain_openrouter_model = os.getenv("LANGCHAIN_OPENROUTER_MODEL", self.openrouter_model)
+        self.langchain_openrouter_base_url = os.getenv(
+            "LANGCHAIN_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+        ).strip()
+        self.langchain_openrouter_temperature = float(os.getenv("LANGCHAIN_OPENROUTER_TEMPERATURE", "0.0"))
+        self.langchain_openrouter_max_tokens = int(os.getenv("LANGCHAIN_OPENROUTER_MAX_TOKENS", "1200"))
+        self.langchain_timeout_seconds = float(os.getenv("LANGCHAIN_TIMEOUT_SECONDS", "35"))
+        self.langchain_schema_max_chars = int(os.getenv("LANGCHAIN_SCHEMA_MAX_CHARS", "18000"))
+        self.langchain_schema_refresh_seconds = int(os.getenv("LANGCHAIN_SCHEMA_REFRESH_SECONDS", "900"))
+        self.langchain_init_retry_seconds = int(os.getenv("LANGCHAIN_INIT_RETRY_SECONDS", "120"))
+
+        self.langchain_shadow_ready = False
+        self.langchain_shadow_last_error: Optional[str] = None
+        self.langchain_schema_source = "uninitialized"
+        self._langchain_chat_model: Any = None
+        self._langchain_graph: Any = None
+        self._langchain_schema_cache: str = ""
+        self._langchain_schema_cache_ts: float = 0.0
+        self._langchain_init_last_attempt_ts: float = 0.0
 
         self._init_llm_client()
         self.node_catalog = self._load_node_catalog()
+        self._init_langchain_shadow_components()
 
     def _init_llm_client(self) -> None:
         """Initialize providers and pick a preferred primary provider."""
@@ -299,6 +354,176 @@ class LLMPipeline:
         if not runtime_schema:
             return self.node_catalog
         return f"{self.node_catalog}\n\n{runtime_schema}"
+
+    def _init_langchain_shadow_components(self) -> None:
+        """Initialize LangChain shadow-mode components (schema-aware Cypher generation only)."""
+        self._langchain_init_last_attempt_ts = time.time()
+        self.langchain_shadow_ready = False
+        self.langchain_shadow_last_error = None
+        self.langchain_schema_source = "uninitialized"
+
+        if not self.langchain_cypher_shadow_enabled:
+            logger.info("LangChain shadow mode disabled")
+            return
+
+        if self.langchain_cypher_provider != "openrouter":
+            self.langchain_shadow_last_error = (
+                f"Unsupported LANGCHAIN_CYPHER_PROVIDER={self.langchain_cypher_provider}; only openrouter is configured"
+            )
+            logger.warning(self.langchain_shadow_last_error)
+            return
+
+        if ChatOpenAI is None or Neo4jGraph is None:
+            self.langchain_shadow_last_error = (
+                "LangChain dependencies unavailable. Install langchain, langchain-community, and langchain-openai"
+            )
+            logger.warning(self.langchain_shadow_last_error)
+            return
+
+        if not self.openrouter_api_key:
+            self.langchain_shadow_last_error = "OPENROUTER_API_KEY is required for LangChain shadow mode"
+            logger.warning(self.langchain_shadow_last_error)
+            return
+
+        neo4j_uri = os.getenv("NEO4J_URI", "").strip()
+        neo4j_username = os.getenv("NEO4J_USERNAME", "").strip()
+        neo4j_password = os.getenv("NEO4J_PASSWORD", "").strip()
+        neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j").strip()
+
+        if not neo4j_uri or not neo4j_username or not neo4j_password:
+            self.langchain_shadow_last_error = (
+                "NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD are required for LangChain schema introspection"
+            )
+            logger.warning(self.langchain_shadow_last_error)
+            return
+
+        headers: Dict[str, str] = {}
+        if self.openrouter_site_url:
+            headers["HTTP-Referer"] = self.openrouter_site_url
+        if self.openrouter_site_name:
+            headers["X-Title"] = self.openrouter_site_name
+
+        try:
+            chat_kwargs: Dict[str, Any] = {
+                "model": self.langchain_openrouter_model,
+                "api_key": self.openrouter_api_key,
+                "base_url": self.langchain_openrouter_base_url,
+                "temperature": self.langchain_openrouter_temperature,
+                "max_tokens": self.langchain_openrouter_max_tokens,
+                "timeout": self.langchain_timeout_seconds,
+            }
+            if headers:
+                chat_kwargs["default_headers"] = headers
+
+            self._langchain_chat_model = ChatOpenAI(**chat_kwargs)
+
+            try:
+                self._langchain_graph = Neo4jGraph(
+                    url=neo4j_uri,
+                    username=neo4j_username,
+                    password=neo4j_password,
+                    database=neo4j_database,
+                )
+                self.langchain_schema_source = "neo4jgraph"
+            except Exception as graph_exc:
+                self._langchain_graph = None
+                self.langchain_schema_source = "active_schema_fallback"
+                self.langchain_shadow_last_error = (
+                    "LangChain Neo4jGraph unavailable; using active schema fallback: "
+                    f"{graph_exc}"
+                )
+                logger.warning(self.langchain_shadow_last_error)
+
+            self._refresh_langchain_schema_cache(force=True)
+
+            self.langchain_shadow_ready = True
+            logger.info(
+                "LangChain shadow mode ready (provider=%s, model=%s, schema_source=%s)",
+                self.langchain_cypher_provider,
+                self.langchain_openrouter_model,
+                self.langchain_schema_source,
+            )
+        except Exception as exc:
+            self.langchain_shadow_last_error = f"LangChain shadow initialization failed: {exc}"
+            self._langchain_graph = None
+            self._langchain_chat_model = None
+            self.langchain_shadow_ready = False
+            logger.warning(self.langchain_shadow_last_error)
+
+    def _refresh_langchain_schema_cache(self, force: bool = False) -> str:
+        """Refresh schema snapshot loaded by LangChain Neo4j graph helper."""
+        now = time.time()
+        if (
+            not force
+            and self._langchain_schema_cache
+            and (now - self._langchain_schema_cache_ts) < self.langchain_schema_refresh_seconds
+        ):
+            return self._langchain_schema_cache
+
+        schema_text = ""
+        try:
+            if self._langchain_graph:
+                refresh_schema = getattr(self._langchain_graph, "refresh_schema", None)
+                if callable(refresh_schema):
+                    refresh_schema()
+
+                schema_text = str(getattr(self._langchain_graph, "get_schema", "") or "").strip()
+                if not schema_text:
+                    structured_schema = getattr(self._langchain_graph, "get_structured_schema", None)
+                    if structured_schema:
+                        schema_text = json.dumps(structured_schema, indent=2, default=str)
+
+            if not schema_text:
+                schema_text = self._active_schema_catalog()
+                self.langchain_schema_source = "active_schema_fallback"
+
+            if self.langchain_schema_max_chars > 0 and len(schema_text) > self.langchain_schema_max_chars:
+                schema_text = schema_text[: self.langchain_schema_max_chars].rstrip()
+
+            self._langchain_schema_cache = schema_text
+            self._langchain_schema_cache_ts = now
+            return schema_text
+        except Exception as exc:
+            self.langchain_shadow_last_error = f"LangChain schema refresh failed: {exc}"
+            logger.warning(self.langchain_shadow_last_error)
+            if self._langchain_schema_cache:
+                return self._langchain_schema_cache
+
+            fallback_schema = self._active_schema_catalog()
+            if self.langchain_schema_max_chars > 0 and len(fallback_schema) > self.langchain_schema_max_chars:
+                fallback_schema = fallback_schema[: self.langchain_schema_max_chars].rstrip()
+            self.langchain_schema_source = "active_schema_fallback"
+            self._langchain_schema_cache = fallback_schema
+            self._langchain_schema_cache_ts = now
+            return fallback_schema
+
+    @staticmethod
+    def _extract_message_text(message_content: Any) -> str:
+        """Convert provider-specific message payloads to plain text."""
+        if isinstance(message_content, str):
+            return message_content
+        if isinstance(message_content, list):
+            parts: List[str] = []
+            for item in message_content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        parts.append(str(text))
+                elif item is not None:
+                    parts.append(str(item))
+            return "".join(parts)
+        if message_content is None:
+            return ""
+        return str(message_content)
+
+    @staticmethod
+    def _check_read_only_cypher(cypher_query: str) -> Tuple[bool, Optional[str]]:
+        """Validate generated query against backend read-only policy."""
+        try:
+            db._validate_read_only_cypher(cypher_query)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
 
     @staticmethod
     def _get_fallback_schema() -> str:
@@ -477,6 +702,75 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
         return f" {alias_norm} " in f" {query_norm} "
 
     @staticmethod
+    def _levenshtein_distance(left: str, right: str) -> int:
+        """Compute edit distance for typo-tolerant entity matching."""
+        if left == right:
+            return 0
+        if not left:
+            return len(right)
+        if not right:
+            return len(left)
+
+        # Use the shorter string for the DP row to keep memory bounded.
+        if len(left) < len(right):
+            left, right = right, left
+
+        previous_row = list(range(len(right) + 1))
+        for left_idx, left_char in enumerate(left, start=1):
+            current_row = [left_idx]
+            for right_idx, right_char in enumerate(right, start=1):
+                insert_cost = current_row[right_idx - 1] + 1
+                delete_cost = previous_row[right_idx] + 1
+                replace_cost = previous_row[right_idx - 1] + (0 if left_char == right_char else 1)
+                current_row.append(min(insert_cost, delete_cost, replace_cost))
+            previous_row = current_row
+
+        return previous_row[-1]
+
+    @classmethod
+    def _normalized_edit_similarity(cls, left: str, right: str) -> float:
+        """Return 0..1 similarity based on normalized edit distance."""
+        left_norm = cls._normalize_lookup_text(left)
+        right_norm = cls._normalize_lookup_text(right)
+        if not left_norm or not right_norm:
+            return 0.0
+
+        max_len = max(len(left_norm), len(right_norm))
+        if max_len == 0:
+            return 0.0
+
+        distance = cls._levenshtein_distance(left_norm, right_norm)
+        return max(0.0, 1.0 - (distance / max_len))
+
+    @classmethod
+    def _best_phrase_similarity(cls, query_norm: str, phrase_norm: str) -> float:
+        """Find best fuzzy score between a phrase and any same-length query n-gram."""
+        query = cls._normalize_lookup_text(query_norm)
+        phrase = cls._normalize_lookup_text(phrase_norm)
+        if not query or not phrase:
+            return 0.0
+
+        query_tokens = query.split()
+        phrase_tokens = phrase.split()
+        if not query_tokens or not phrase_tokens:
+            return 0.0
+
+        if len(query_tokens) < len(phrase_tokens):
+            return cls._normalized_edit_similarity(query, phrase)
+
+        window_size = len(phrase_tokens)
+        best = 0.0
+        for index in range(len(query_tokens) - window_size + 1):
+            candidate = " ".join(query_tokens[index : index + window_size])
+            score = cls._normalized_edit_similarity(candidate, phrase)
+            if score > best:
+                best = score
+            if best >= 0.99:
+                return best
+
+        return max(best, cls._normalized_edit_similarity(query, phrase))
+
+    @staticmethod
     def _quote_cypher_string(value: str) -> str:
         """Escape a Python string for safe embedding in single-quoted Cypher literals."""
         return (value or "").replace("\\", "\\\\").replace("'", "\\'")
@@ -496,6 +790,7 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
         query_norm = self._normalize_lookup_text(user_query)
         if not query_norm:
             return []
+        query_tokens = query_norm.split()
 
         scores: Dict[str, int] = {}
 
@@ -509,6 +804,12 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
             alias_norm = self._normalize_lookup_text(alias)
             if self._contains_alias(query_norm, alias_norm):
                 add_score(entity_id, 200 + len(alias_norm))
+                continue
+
+            if len(alias_norm) >= 4:
+                fuzzy_score = self._best_phrase_similarity(query_norm, alias_norm)
+                if fuzzy_score >= self.entity_resolution_alias_fuzzy_threshold:
+                    add_score(entity_id, int(130 * fuzzy_score) + len(alias_norm))
 
         # 2) Dynamic aliases from live entities to reduce hardcoded drift.
         entities: List[Dict[str, Any]] = []
@@ -551,12 +852,37 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
                 }
 
                 for alias in alias_variants:
-                    if len(alias) >= 3 and self._contains_alias(query_norm, alias):
+                    if len(alias) < 3:
+                        continue
+
+                    if self._contains_alias(query_norm, alias):
                         add_score(entity_id, 90 + len(alias))
+                        continue
+
+                    if len(alias) >= 5:
+                        fuzzy_score = self._best_phrase_similarity(query_norm, alias)
+                        if fuzzy_score >= self.entity_resolution_dynamic_fuzzy_threshold:
+                            add_score(entity_id, int(90 * fuzzy_score) + len(alias))
 
                 for token in entity_tokens.get(entity_id, []):
-                    if token_frequency.get(token) == 1 and self._contains_alias(query_norm, token):
+                    if token_frequency.get(token) != 1:
+                        continue
+
+                    if self._contains_alias(query_norm, token):
                         add_score(entity_id, 40 + len(token))
+                        continue
+
+                    if len(token) >= 5:
+                        best_token_score = max(
+                            (
+                                self._normalized_edit_similarity(query_token, token)
+                                for query_token in query_tokens
+                                if abs(len(query_token) - len(token)) <= 2
+                            ),
+                            default=0.0,
+                        )
+                        if best_token_score >= self.entity_resolution_token_fuzzy_threshold:
+                            add_score(entity_id, int(35 * best_token_score) + len(token))
 
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         if not ranked:
@@ -612,6 +938,118 @@ MATCH, OPTIONAL MATCH, WHERE, WITH, RETURN, ORDER BY, LIMIT, COUNT, COLLECT, DIS
             )
 
         return None
+
+    def _build_entity_resolution_hint(self, user_query: str, resolved_entity_ids: List[str]) -> str:
+        """Build optional resolved-id hint block for Cypher generation prompts."""
+        if not resolved_entity_ids:
+            return ""
+
+        has_compare_intent = self._has_explicit_compare_intent(user_query)
+        if len(resolved_entity_ids) == 1 and not self._is_aggregation_query(user_query):
+            resolved_id = self._quote_cypher_string(resolved_entity_ids[0])
+            return (
+                "\n\n[RESOLVED_ENTITY_ID]\n"
+                f"{resolved_id}\n"
+                "Use WHERE n.id = '<resolved_id>' as primary filter unless question explicitly asks for all entities."
+            )
+
+        if len(resolved_entity_ids) >= 2 and has_compare_intent:
+            resolved_literal_list = ", ".join(
+                [f"'{self._quote_cypher_string(entity_id)}'" for entity_id in resolved_entity_ids[:3]]
+            )
+            return (
+                "\n\n[RESOLVED_ENTITY_IDS]\n"
+                f"{resolved_literal_list}\n"
+                "When comparing or disambiguating these entities, use WHERE n.id IN [..] as primary filter."
+            )
+
+        return ""
+
+    def _run_langchain_cypher_shadow(self, user_query: str) -> Dict[str, Any]:
+        """Generate Cypher in shadow mode using LangChain + live Neo4j schema."""
+        if not self.langchain_cypher_shadow_enabled:
+            return {
+                "enabled": False,
+                "status": "disabled",
+            }
+
+        if not self.langchain_shadow_ready:
+            now = time.time()
+            if (now - self._langchain_init_last_attempt_ts) >= self.langchain_init_retry_seconds:
+                self._init_langchain_shadow_components()
+
+        if not self.langchain_shadow_ready or self._langchain_chat_model is None:
+            return {
+                "enabled": True,
+                "status": "unavailable",
+                "error": self.langchain_shadow_last_error,
+            }
+
+        started = time.time()
+
+        try:
+            schema_context = self._refresh_langchain_schema_cache()
+            if not schema_context:
+                raise ValueError("LangChain schema cache is empty")
+
+            resolved_entity_ids = self._resolve_entity_ids_from_query(user_query)
+            entity_resolution_hint = self._build_entity_resolution_hint(user_query, resolved_entity_ids)
+
+            system_prompt = self._build_cypher_system_prompt(schema_context)
+            user_prompt = (
+                "Generate a Cypher query for this question:\n"
+                f"{user_query}"
+                f"{entity_resolution_hint}\n\n"
+                "Return only Cypher."
+            )
+
+            model_response = self._langchain_chat_model.invoke(
+                [
+                    ("system", system_prompt),
+                    ("human", user_prompt),
+                ]
+            )
+
+            response_text = self._extract_message_text(getattr(model_response, "content", model_response))
+            cypher_query = self._normalize_cypher_for_neo4j(self._extract_cypher(response_text))
+            read_only_cypher, safety_error = self._check_read_only_cypher(cypher_query)
+
+            execution_success = False
+            execution_error: Optional[str] = None
+            data_rows = 0
+            if read_only_cypher:
+                try:
+                    shadow_results = db.execute_raw_cypher(cypher_query)
+                    data_rows = len(shadow_results) if isinstance(shadow_results, list) else 0
+                    execution_success = True
+                except Exception as exec_exc:
+                    execution_error = str(exec_exc)
+
+            return {
+                "enabled": True,
+                "status": "ok",
+                "provider": "langchain-openrouter",
+                "model": self.langchain_openrouter_model,
+                "schema_source": self.langchain_schema_source,
+                "schema_chars": len(schema_context),
+                "duration_ms": int((time.time() - started) * 1000),
+                "read_only_cypher": read_only_cypher,
+                "safety_error": safety_error,
+                "execution_success": execution_success,
+                "execution_error": execution_error,
+                "data_rows": data_rows,
+                "cypher_query": cypher_query,
+            }
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "status": "error",
+                "provider": "langchain-openrouter",
+                "model": self.langchain_openrouter_model,
+                "schema_source": self.langchain_schema_source,
+                "duration_ms": int((time.time() - started) * 1000),
+                "error": str(exc),
+            }
 
     def _build_groq_schema_context(self, user_query: str, schema_catalog: Optional[str] = None) -> str:
         """Build a size-safe schema context for Groq: compact schema + retrieved excerpts."""
@@ -925,6 +1363,60 @@ Rules:
                 break
 
         raise ValueError("All LLM providers failed: " + " | ".join(errors))
+
+    def _provider_order_with_preference(self, preferred_provider: Optional[str]) -> List[str]:
+        """Build provider order with an optional preferred provider first."""
+        if not self.available_providers:
+            return []
+
+        if not preferred_provider or preferred_provider in {"", "auto", "default"}:
+            return [self.provider] + [p for p in self.available_providers if p != self.provider]
+
+        preferred = preferred_provider.strip().lower()
+        ordered: List[str] = []
+        if preferred in self.available_providers:
+            ordered.append(preferred)
+
+        for provider in [self.provider] + self.available_providers:
+            if provider not in ordered:
+                ordered.append(provider)
+        return ordered
+
+    def _call_llm_with_preference(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        preferred_provider: Optional[str] = None,
+    ) -> str:
+        """Call LLM using an optional preferred provider, then fallback providers."""
+        provider_order = self._provider_order_with_preference(preferred_provider)
+        if not provider_order:
+            raise ValueError("No LLM providers are initialized")
+
+        errors: List[str] = []
+        for idx, provider in enumerate(provider_order):
+            try:
+                return self._call_with_provider(provider, system_prompt, user_prompt)
+            except Exception as exc:
+                error_text = str(exc)
+                errors.append(f"{provider}: {error_text}")
+
+                has_fallback = idx < len(provider_order) - 1
+                if has_fallback:
+                    if self._is_fallback_eligible_error(error_text):
+                        logger.warning(
+                            "Preferred provider %s failed with retryable error; attempting fallback provider.",
+                            provider,
+                        )
+                    else:
+                        logger.warning(
+                            "Preferred provider %s failed; attempting fallback provider.",
+                            provider,
+                        )
+                    continue
+                break
+
+        raise ValueError("All preferred/fallback LLM providers failed: " + " | ".join(errors))
 
     @staticmethod
     def _extract_cypher(llm_output: str) -> str:
@@ -1388,23 +1880,7 @@ Rules:
         schema_context = self._schema_context_for_query(user_query)
         system_prompt = self._build_cypher_system_prompt(schema_context)
 
-        entity_resolution_hint = ""
-        if resolved_entity_ids:
-            has_compare_intent = self._has_explicit_compare_intent(user_query)
-            if len(resolved_entity_ids) == 1 and not self._is_aggregation_query(user_query):
-                resolved_id = self._quote_cypher_string(resolved_entity_ids[0])
-                entity_resolution_hint = (
-                    "\n\n[RESOLVED_ENTITY_ID]\n"
-                    f"{resolved_id}\n"
-                    "Use WHERE n.id = '<resolved_id>' as primary filter unless question explicitly asks for all entities."
-                )
-            elif len(resolved_entity_ids) >= 2 and has_compare_intent:
-                resolved_literal_list = ", ".join([f"'{self._quote_cypher_string(entity_id)}'" for entity_id in resolved_entity_ids[:3]])
-                entity_resolution_hint = (
-                    "\n\n[RESOLVED_ENTITY_IDS]\n"
-                    f"{resolved_literal_list}\n"
-                    "When comparing or disambiguating these entities, use WHERE n.id IN [..] as primary filter."
-                )
+        entity_resolution_hint = self._build_entity_resolution_hint(user_query, resolved_entity_ids)
 
         user_prompt = (
             "Generate a Cypher query for this question:\n"
@@ -1438,6 +1914,31 @@ Rules:
         logger.info("[LLM-CYPHER-GEN] Generated: %s", cypher_query[:200])
         return cypher_query
 
+    @staticmethod
+    def _response_depth_from_query(user_query: str) -> str:
+        """Infer whether the user expects a brief, standard, or detailed response."""
+        query_lower = (user_query or "").lower()
+
+        concise_markers = ["brief", "short", "quick", "summary", "one line", "tldr"]
+        detailed_markers = [
+            "detailed",
+            "in depth",
+            "deep",
+            "explain",
+            "analyze",
+            "critical",
+            "compare",
+            "breakdown",
+            "walk through",
+            "insight",
+        ]
+
+        if any(marker in query_lower for marker in concise_markers):
+            return "concise"
+        if any(marker in query_lower for marker in detailed_markers):
+            return "detailed"
+        return "standard"
+
     def _synthesize_from_cypher(self, user_query: str, cypher_results: List[Dict[str, Any]]) -> str:
         """Call 2: Convert raw query results into a natural language answer."""
         logger.info("[LLM-ANSWER-GEN] Synthesizing answer for: %s", user_query[:120])
@@ -1449,6 +1950,17 @@ Rules:
 
         synthesis_rows, was_truncated, total_rows = self._prepare_results_for_synthesis(cypher_results)
         results_json = json.dumps(synthesis_rows, indent=2, default=str)
+        response_depth = self._response_depth_from_query(user_query)
+
+        format_instructions = {
+            "concise": "Use 1 short paragraph and include the key value(s) directly.",
+            "standard": "Use 2-3 short paragraphs, prioritizing facts and direct interpretation.",
+            "detailed": (
+                "Use a detailed multi-paragraph answer with clear structure: "
+                "(1) direct findings, (2) interpretation, (3) caveats if data is missing."
+            ),
+        }
+
         system_prompt = """You are a data analyst for Nigerian upstream petroleum data.
 
 You will receive:
@@ -1458,13 +1970,15 @@ You will receive:
 Rules:
 1. Answer only from the provided JSON results.
 2. Do not invent fields, values, or entities.
-3. If no results exist, say: "No data found for this query."
+3. If no results exist, say exactly: "No data found for this query."
 4. If values are null or NOT_AVAILABLE, state that clearly.
-5. Keep the answer concise but complete.
+5. Keep writing clean and readable (no broken line fragments).
 """
 
         user_prompt = (
             f"User question:\n{user_query}\n\n"
+            f"Preferred response depth: {response_depth}. "
+            f"Formatting guidance: {format_instructions[response_depth]}\n\n"
             f"Database JSON results:\n{results_json}\n\n"
             "Answer in natural language."
         )
@@ -1573,11 +2087,206 @@ Rules:
             "equity": ["equity", "stake", "ownership"],
             "blocks": ["block", "oml", "opl", "field"],
             "operations": ["operational", "status", "disruption"],
+            "finance": ["revenue", "income", "profit", "cost", "investment"],
+            "policy": ["policy", "regulation", "compliance", "licensing"],
         }
         for topic, keywords in topic_map.items():
             if any(keyword in query_lower for keyword in keywords):
                 return topic
         return "overview"
+
+    @staticmethod
+    def _clean_answer_text(answer: str) -> str:
+        """Normalize whitespace so returned prose is paragraph-friendly."""
+        cleaned = re.sub(r"[\t ]+", " ", str(answer or "")).strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"\s+\n", "\n", cleaned)
+        return cleaned
+
+    @staticmethod
+    def _db_answer_has_signal(base_answer: str, cypher_results: List[Dict[str, Any]]) -> bool:
+        """Determine whether DB path returned meaningful evidence."""
+        if cypher_results:
+            return True
+
+        text = (base_answer or "").strip().lower()
+        if not text:
+            return False
+
+        no_signal_markers = [
+            "no data found for this query",
+            "i could not retrieve this answer",
+            "pipeline error",
+            "unable to process query",
+            "took too long",
+        ]
+        return not any(marker in text for marker in no_signal_markers)
+
+    def _condense_web_source_briefs(
+        self,
+        user_query: str,
+        source_briefs: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Condense verbose web evidence, optionally using a cheaper helper model."""
+        if not source_briefs:
+            return []
+
+        limited = source_briefs[: self.web_sources_for_synthesis]
+        normalized: List[Dict[str, Any]] = []
+        for brief in limited:
+            normalized.append(
+                {
+                    "title": str(brief.get("title", "Unknown")).strip(),
+                    "url": brief.get("url"),
+                    "provider": str(brief.get("provider", "unknown")).strip(),
+                    "text": str(brief.get("text", "")).strip()[: self.web_source_max_chars],
+                }
+            )
+
+        total_chars = sum(len(item.get("text", "")) for item in normalized)
+        if total_chars <= self.web_answer_max_chars:
+            return normalized
+
+        if not self.web_multi_model_enabled:
+            return normalized
+
+        condensed: List[Dict[str, Any]] = []
+        for brief in normalized[:6]:
+            source_text = brief.get("text", "")
+            if not source_text:
+                continue
+
+            system_prompt = """You are an evidence condenser.
+
+Summarize one web source into a compact evidence note.
+Rules:
+1. Keep only factual claims present in source text.
+2. Preserve important numbers, dates, and entities.
+3. Use at most 4 short bullet points.
+4. Do not add new claims.
+"""
+            user_prompt = (
+                f"User question:\n{user_query}\n\n"
+                f"Source title: {brief.get('title')}\n"
+                f"Provider: {brief.get('provider')}\n"
+                f"URL: {brief.get('url')}\n\n"
+                f"Source text:\n{source_text}\n\n"
+                "Return compact bullet evidence now."
+            )
+
+            try:
+                reduced = self._call_llm_with_preference(
+                    system_prompt,
+                    user_prompt,
+                    preferred_provider=self.web_source_summary_provider,
+                )
+                brief["text"] = str(reduced).strip()[: max(400, self.web_source_max_chars // 2)]
+            except Exception as exc:
+                logger.warning("Web source condensation failed for '%s': %s", brief.get("title"), exc)
+                brief["text"] = source_text[: max(400, self.web_source_max_chars // 2)]
+
+            condensed.append(brief)
+
+        return condensed or normalized
+
+    def _synthesize_web_augmented_answer(
+        self,
+        user_query: str,
+        base_answer: str,
+        cypher_results: List[Dict[str, Any]],
+        synthesis: Dict[str, Any],
+        web_results: Dict[str, Any],
+    ) -> str:
+        """Create a final answer that blends DB and web evidence analytically."""
+        db_has_signal = self._db_answer_has_signal(base_answer, cypher_results)
+        response_depth = self._response_depth_from_query(user_query)
+
+        source_briefs = self._condense_web_source_briefs(
+            user_query,
+            synthesis.get("source_briefs", []),
+        )
+        provider_counts = web_results.get("provider_counts", {}) if isinstance(web_results, dict) else {}
+        data_points = synthesis.get("data_points", [])[:40]
+        db_rows = cypher_results[:15]
+
+        if self.web_priority_mode == "web_first":
+            mode_instruction = (
+                "Always prioritize web evidence first. Use database rows only as secondary corroboration. "
+                "If sources conflict, prefer multi-source web consensus and state the discrepancy."
+            )
+        elif self.web_priority_mode == "db_first":
+            mode_instruction = (
+                "Always prioritize database rows first. Use web evidence as supplementary context only."
+            )
+        else:
+            mode_instruction = (
+                "Database has no usable rows. Prioritize web evidence and explicitly mention that database rows were unavailable."
+                if not db_has_signal
+                else "Database has usable rows. Use database facts as the anchor and web evidence for expansion and recency context."
+            )
+
+        depth_instruction_map = {
+            "concise": "Use one short paragraph plus one optional bullet list only if needed.",
+            "standard": "Use 2-3 focused paragraphs with clear flow and concise interpretation.",
+            "detailed": (
+                "Use a structured in-depth response with sections: Direct answer, Evidence breakdown, "
+                "Cross-source analysis, and Caveats/uncertainty."
+            ),
+        }
+
+        system_prompt = """You are an analytical research assistant for Nigerian upstream petroleum intelligence.
+
+You will receive database outputs and external web evidence.
+Your job is to produce a clean, tailored final answer.
+
+Rules:
+1. Answer the user's question directly first.
+2. Use only evidence supplied in the prompt.
+3. Reconcile conflicts carefully; if uncertain, say so.
+4. Keep writing clean, paragraph-based, with no broken line fragments.
+5. Avoid filler text; be factual and specific.
+"""
+
+        user_prompt = (
+            f"User question:\n{user_query}\n\n"
+            f"Response depth: {response_depth}. {depth_instruction_map[response_depth]}\n"
+            f"Priority mode: {mode_instruction}\n\n"
+            f"Database answer draft:\n{base_answer}\n\n"
+            f"Database rows (sample):\n{json.dumps(db_rows, indent=2, default=str)}\n\n"
+            f"Web provider coverage counts:\n{json.dumps(provider_counts, indent=2, default=str)}\n\n"
+            f"Web extracted data points:\n{json.dumps(data_points, indent=2, default=str)}\n\n"
+            f"Web source briefs:\n{json.dumps(source_briefs, indent=2, default=str)}\n\n"
+            "Return the final answer now."
+        )
+
+        try:
+            final_answer = self._call_llm_with_preference(
+                system_prompt,
+                user_prompt,
+                preferred_provider=self.web_final_synthesis_provider,
+            )
+            return self._clean_answer_text(final_answer)
+        except Exception as exc:
+            logger.warning("Web-augmented synthesis failed; using deterministic fallback: %s", exc)
+
+            web_summary = synthesis.get("synthesis", "")
+            if not db_has_signal and web_summary:
+                fallback = (
+                    "I could not find matching rows in the internal database for this query. "
+                    "Based on external web evidence, here is the best available summary:\n\n"
+                    f"{web_summary}"
+                )
+                return self._clean_answer_text(fallback)
+
+            if web_summary:
+                fallback = (
+                    f"{base_answer}\n\n"
+                    "Additional external context:\n"
+                    f"{web_summary}"
+                )
+                return self._clean_answer_text(fallback)
+
+            return self._clean_answer_text(base_answer)
 
     def _maybe_add_web_context(
         self,
@@ -1585,59 +2294,88 @@ Rules:
         base_answer: str,
         cypher_results: List[Dict[str, Any]],
     ) -> Tuple[str, Optional[str], List[Dict[str, Any]]]:
-        """Add optional supplementary web context for DB-backed answers."""
+        """Blend database output with extensive web evidence when enabled."""
         if not self.web_enrichment_enabled:
-            return base_answer, None, []
-
-        # User requested DB+web enrichment; skip only when database has no rows.
-        if not cypher_results:
             return base_answer, None, []
 
         if not hybrid_searcher:
             return base_answer, None, []
 
-        entity_id, entity_name = self._extract_entity_identity(cypher_results)
+        entity_id: Optional[str] = None
+        entity_name: Optional[str] = None
+        if cypher_results:
+            entity_id, entity_name = self._extract_entity_identity(cypher_results)
+
+        if not entity_name:
+            resolved_entity_ids = self._resolve_entity_ids_from_query(user_query)
+            if resolved_entity_ids:
+                entity_id = entity_id or resolved_entity_ids[0]
+                try:
+                    canonical_entity = db.get_entity_by_id(resolved_entity_ids[0], "UpstreamProducer")
+                except Exception as exc:
+                    logger.debug("Entity lookup for web fallback failed: %s", exc)
+                    canonical_entity = None
+
+                if isinstance(canonical_entity, dict):
+                    canonical_name = canonical_entity.get("name")
+                    if isinstance(canonical_name, str) and canonical_name.strip():
+                        entity_name = canonical_name.strip()
 
         # If no single entity is obvious, enrich using query-level target.
         target = entity_name if entity_name else user_query
 
         topic = self._topic_from_query(user_query)
-        web_results = hybrid_searcher.search_and_scrape(target, topic)
+        try:
+            web_results = hybrid_searcher.search_and_scrape(target, topic)
+        except Exception as exc:
+            logger.warning("Web enrichment search failed: %s", exc)
+            return self._clean_answer_text(base_answer), entity_name, []
+
         if not web_results:
-            return base_answer, entity_name, []
+            return self._clean_answer_text(base_answer), entity_name, []
 
         db_snapshot = cypher_results[0] if cypher_results and isinstance(cypher_results[0], dict) else {}
         synthesis = synthesize_web_results(target, db_snapshot, web_results, topic)
+        answer = self._synthesize_web_augmented_answer(
+            user_query,
+            base_answer,
+            cypher_results,
+            synthesis,
+            web_results,
+        )
 
-        web_summary = web_results.get("tavily_summary", "").strip()
-        if web_summary:
-            answer = (
-                f"{base_answer}\n\n"
-                f"Supplementary web context (Tavily/Firecrawl, non-database): {web_summary}"
+        sources: List[Dict[str, Any]] = []
+        seen_sources = set()
+        for source in synthesis.get("sources", []):
+            source_type = str(source.get("type") or "unknown").lower()
+            if source_type == "database":
+                continue
+            url = source.get("url")
+            name = source.get("name", "Unknown")
+            key = (str(url or "") + "|" + str(name)).lower()
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            sources.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "type": source_type,
+                }
             )
-        else:
-            answer = base_answer
 
-        # Keep only true web sources in outward provenance list.
-        sources = [
-            source
-            for source in synthesis.get("sources", [])
-            if source.get("type") in {"tavily", "firecrawl"}
-        ]
-
-        # Fallback to discovered Tavily sources when parsed synthesis contains none.
         if not sources:
             discovered = web_results.get("discovered_sources", [])
-            for item in discovered[:5]:
+            for item in discovered[:8]:
                 sources.append(
                     {
                         "name": item.get("title", "Unknown"),
                         "url": item.get("url"),
-                        "type": "tavily",
+                        "type": item.get("provider", "web"),
                     }
                 )
 
-        return answer, entity_name, sources
+        return self._clean_answer_text(answer), entity_name, sources
 
     def process_question(
         self,
@@ -1661,9 +2399,15 @@ Rules:
                     "sources": [],
                     "used_web_enrichment": False,
                     "llm_provider": None,
+                    "langchain_shadow": {
+                        "enabled": self.langchain_cypher_shadow_enabled,
+                        "status": "skipped_security_block",
+                    },
                     "is_success": False,
                     "error": "security_blocked",
                 }
+
+            langchain_shadow = self._run_langchain_cypher_shadow(user_query)
 
             pipeline_result = self._text_to_cypher_pipeline(user_query)
             cypher_query = pipeline_result["cypher_query"]
@@ -1692,16 +2436,41 @@ Rules:
                 "sources": sources,
                 "used_web_enrichment": used_web_enrichment,
                 "llm_provider": self.last_provider_used or self.provider,
+                "langchain_shadow": langchain_shadow,
                 "is_success": True,
             }
 
         except Exception as exc:
             logger.error("[%s] Pipeline failure: %s", request_id, exc, exc_info=True)
+
+            fallback_answer, fallback_entity_name, fallback_sources = self._maybe_add_web_context(
+                user_query,
+                "I could not retrieve this answer from the internal database pipeline.",
+                [],
+            )
+            if fallback_sources:
+                return {
+                    "answer": fallback_answer,
+                    "entity_id": None,
+                    "entity_name": fallback_entity_name,
+                    "data_retrieved": [],
+                    "cypher_query": None,
+                    "sources": fallback_sources,
+                    "used_web_enrichment": True,
+                    "llm_provider": self.last_provider_used or self.provider,
+                    "is_success": True,
+                    "error": "db_pipeline_fallback_to_web",
+                }
+
             return {
                 "answer": f"Pipeline error: {str(exc)}",
                 "entity_id": None,
                 "entity_name": None,
                 "used_web_enrichment": False,
+                "langchain_shadow": {
+                    "enabled": self.langchain_cypher_shadow_enabled,
+                    "status": "pipeline_error",
+                },
                 "is_success": False,
                 "error": "pipeline",
             }

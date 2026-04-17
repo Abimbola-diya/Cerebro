@@ -1,295 +1,566 @@
-"""
-Web Search Integration Module
-Combines Tavily (news/automated discovery) and Firecrawl (deep scraping)
-for comprehensive data enrichment.
+"""Web search and scraping utilities for external evidence enrichment.
 
-Production-Grade Features:
-✅ Timeout handling (30s per search)
-✅ Graceful error handling
-✅ Retry logic
-✅ Connection error handling
+This module blends multiple discovery providers (Tavily, DuckDuckGo,
+Wikipedia, optional Serper) and then deep-scrapes top candidates with
+Firecrawl to build richer, cleaner context for answer synthesis.
 """
 
-import os
-import json
+from __future__ import annotations
+
 import logging
-import requests
+import os
+import re
 import time
-from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-# Configure logging
+import requests
+
 logger = logging.getLogger(__name__)
 
 try:
     from tavily import TavilyClient
-except ImportError:
-    logger.warning("TavilyClient not available")
+except Exception:  # pragma: no cover - optional dependency
     TavilyClient = None
 
-# Timeout constants (in seconds)
+try:
+    from duckduckgo_search import DDGS  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    DDGS = None
+
+
 TAVILY_TIMEOUT = 30
 FIRECRAWL_TIMEOUT = 20
+SERPER_TIMEOUT = 20
+WIKIPEDIA_TIMEOUT = 15
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except Exception:
+        return max(minimum, default)
+
+
+def _clean_text(text: Any, max_chars: int = 3000) -> str:
+    """Normalize noisy snippet/scrape text into paragraph-safe plain text."""
+    if text is None:
+        return ""
+
+    value = str(text)
+    value = re.sub(r"```[\s\S]*?```", " ", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = value.replace("\u00a0", " ")
+    value = re.sub(r"\[[0-9]+\]", " ", value)
+    value = re.sub(r"(?:\r\n|\r|\n)+", "\n", value)
+    value = re.sub(r"[\t ]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r"\s{2,}", " ", value)
+    value = value.strip(" \n")
+
+    if len(value) > max_chars:
+        value = value[:max_chars].rstrip()
+    return value
+
+
+def _normalize_url(url: Any) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    return text.rstrip("/")
+
 
 class TavilySearcher:
-    """Search for news, articles, and information about companies using Tavily."""
-    
-    def __init__(self):
+    """Search for external context with Tavily."""
+
+    def __init__(self) -> None:
+        self.client: Any = None
         api_key = os.getenv("TAVILY_API_KEY")
+
         if not api_key:
-            logger.warning("TAVILY_API_KEY environment variable not set")
-            self.client = None
+            logger.warning("TAVILY_API_KEY not set; Tavily discovery disabled")
             return
-        
+        if TavilyClient is None:
+            logger.warning("tavily-python not installed; Tavily discovery disabled")
+            return
+
         try:
             self.client = TavilyClient(api_key=api_key)
-        except Exception as e:
-            logger.error(f"Failed to initialize TavilyClient: {e}")
+        except Exception as exc:
+            logger.warning("Failed to initialize Tavily client: %s", exc)
             self.client = None
-    
-    def search(self, company_name: str, query: str) -> Dict[str, Any]:
-        """
-        Search for information about a company.
-        
-        Args:
-            company_name: Name of the company
-            query: Specific query (e.g., "production capacity", "reserves")
-            
-        Returns:
-            Dict with search results and sources
-            
-        Handles:
-        ✅ API timeouts
-        ✅ Connection errors
-        ✅ Rate limiting
-        ✅ Empty results
-        """
+
+        self.max_results_per_query = _env_int("TAVILY_MAX_RESULTS_PER_QUERY", 6)
+        self.max_query_variants = _env_int("TAVILY_QUERY_VARIANTS", 2)
+        self.search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "advanced").strip() or "advanced"
+        self.topic = os.getenv("TAVILY_TOPIC", "general").strip() or "general"
+        self.include_raw_content = _env_bool("TAVILY_INCLUDE_RAW_CONTENT", True)
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    def _build_search_queries(self, subject: str, focus: str) -> List[str]:
+        candidates = [
+            f"{subject} {focus} Nigeria upstream oil and gas",
+            f"{subject} {focus} latest update Nigeria petroleum sector",
+            f"{subject} {focus} production reserves operations outlook",
+        ]
+
+        seen = set()
+        queries: List[str] = []
+        for raw in candidates:
+            normalized = " ".join(raw.split()).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            queries.append(normalized)
+            if len(queries) >= self.max_query_variants:
+                break
+
+        return queries
+
+    def _run_single_search(self, search_query: str) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"results": [], "answer": "", "error": "tavily_disabled"}
+
+        base_kwargs: Dict[str, Any] = {
+            "include_answer": True,
+            "max_results": self.max_results_per_query,
+        }
+        advanced_kwargs: Dict[str, Any] = {
+            "search_depth": self.search_depth,
+            "topic": self.topic,
+        }
+        if self.include_raw_content:
+            advanced_kwargs["include_raw_content"] = True
+
         try:
-            if not self.client:
-                logger.warning("Tavily client not initialized")
-                return {"results": [], "sources": [], "error": "Tavily not available"}
-            
-            # Build search query
-            search_query = f"{company_name} {query} 2026 Nigeria oil"
-            
-            logger.debug(f"[TAVILY] Starting search: {search_query}")
-            
-            start_time = time.time()
-            
-            # Use Tavily's search with timeout
+            response = self.client.search(search_query, **base_kwargs, **advanced_kwargs)
+        except TypeError:
+            response = self.client.search(search_query, **base_kwargs)
+
+        return response if isinstance(response, dict) else {"results": [], "answer": ""}
+
+    def search(self, subject: str, focus: str) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"sources": [], "ai_summary": "", "queries": [], "num_results": 0}
+
+        queries = self._build_search_queries(subject, focus)
+        summaries: List[str] = []
+        unique_sources: List[Dict[str, Any]] = []
+        seen = set()
+
+        started = time.time()
+        for query in queries:
             try:
-                response = self.client.search(
-                    search_query,
-                    include_answer=True,
-                    max_results=5
+                response = self._run_single_search(query)
+            except Exception as exc:
+                logger.warning("Tavily search failed for variant '%s': %s", query, exc)
+                continue
+
+            answer = _clean_text(response.get("answer", ""), max_chars=900)
+            if answer:
+                summaries.append(answer)
+
+            for rank, item in enumerate(response.get("results", []) or [], start=1):
+                url = _normalize_url(item.get("url"))
+                title = _clean_text(item.get("title", ""), max_chars=300)
+                dedupe_key = url.lower() if url else title.lower()
+                if not dedupe_key or dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                unique_sources.append(
+                    {
+                        "title": title or "Untitled source",
+                        "url": url,
+                        "content": _clean_text(item.get("content", ""), max_chars=2000),
+                        "raw_content": _clean_text(item.get("raw_content", ""), max_chars=6000),
+                        "provider": "tavily",
+                        "provider_rank": rank,
+                        "query": query,
+                    }
                 )
-            except TimeoutError:
-                elapsed = time.time() - start_time
-                logger.warning(f"[TAVILY] Search timeout after {elapsed:.1f}s")
-                return {"results": [], "sources": [], "error": "Search timeout"}
-            except Exception as e:
-                logger.error(f"[TAVILY] Search error: {e}")
-                return {"results": [], "sources": [], "error": str(e)}
-            
-            elapsed = time.time() - start_time
-            num_results = len(response.get('results', []))
-            logger.debug(f"[TAVILY] Search returned {num_results} results in {elapsed:.2f}s")
-            
-            if num_results > 0:
-                for i, result in enumerate(response.get('results', [])[:3], 1):
-                    title = result.get("title", "")[:60]
-                    content = result.get("content", "")[:80]
-                    print(f"[TAVILY]   Result {i}: {title}... - {content}...")
-            else:
-                print(f"[TAVILY] WARNING: No results returned for query: {search_query}")
-            
-            return {
-                "sources": response.get("results", []),
-                "ai_summary": response.get("answer", ""),
-                "query": search_query,
-                "num_results": num_results
-            }
-        except Exception as e:
-            print(f"[TAVILY] ERROR: {str(e)}")
-            return {"sources": [], "ai_summary": "", "error": str(e), "num_results": 0}
+
+        elapsed = time.time() - started
+        logger.info("Tavily discovery completed: %d unique sources in %.2fs", len(unique_sources), elapsed)
+
+        return {
+            "sources": unique_sources,
+            "ai_summary": " ".join(summaries[:3]).strip(),
+            "queries": queries,
+            "num_results": len(unique_sources),
+        }
+
+
+class SerperSearcher:
+    """Optional Google-based search via serper.dev."""
+
+    def __init__(self) -> None:
+        self.api_key = os.getenv("SERPER_API_KEY", "").strip()
+        self.enabled = bool(self.api_key)
+        self.max_results = _env_int("SERPER_MAX_RESULTS", 6)
+        self.timeout_seconds = _env_int("SERPER_TIMEOUT_SECONDS", SERPER_TIMEOUT)
+        self.endpoint = "https://google.serper.dev/search"
+
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+
+        try:
+            response = requests.post(
+                self.endpoint,
+                headers={
+                    "X-API-KEY": self.api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "num": self.max_results},
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code != 200:
+                logger.warning("Serper returned status=%s", response.status_code)
+                return []
+
+            payload = response.json()
+            organic = payload.get("organic", [])
+            normalized: List[Dict[str, Any]] = []
+            for rank, item in enumerate(organic, start=1):
+                normalized.append(
+                    {
+                        "title": _clean_text(item.get("title", ""), max_chars=300),
+                        "url": _normalize_url(item.get("link")),
+                        "content": _clean_text(item.get("snippet", ""), max_chars=1800),
+                        "provider": "serper",
+                        "provider_rank": rank,
+                    }
+                )
+            return normalized
+        except Exception as exc:
+            logger.warning("Serper search failed: %s", exc)
+            return []
+
+
+class DuckDuckGoSearcher:
+    """No-key search expansion using duckduckgo-search package."""
+
+    def __init__(self) -> None:
+        self.enabled = _env_bool("DUCKDUCKGO_ENABLED", True) and DDGS is not None
+        self.max_results = _env_int("DUCKDUCKGO_MAX_RESULTS", 8)
+        self.timeout_seconds = _env_int("DUCKDUCKGO_TIMEOUT_SECONDS", 18)
+        if DDGS is None:
+            logger.warning("duckduckgo-search not installed; DuckDuckGo discovery disabled")
+
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        if DDGS is None:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        try:
+            with DDGS(timeout=self.timeout_seconds) as ddgs:
+                raw_items = list(ddgs.text(query, max_results=self.max_results))
+        except Exception as exc:
+            logger.warning("DuckDuckGo search failed: %s", exc)
+            return []
+
+        for rank, item in enumerate(raw_items, start=1):
+            results.append(
+                {
+                    "title": _clean_text(item.get("title", ""), max_chars=300),
+                    "url": _normalize_url(item.get("href")),
+                    "content": _clean_text(item.get("body", ""), max_chars=1800),
+                    "provider": "duckduckgo",
+                    "provider_rank": rank,
+                }
+            )
+        return results
+
+
+class WikipediaSearcher:
+    """Lightweight no-key encyclopedic lookup."""
+
+    def __init__(self) -> None:
+        self.enabled = _env_bool("WIKIPEDIA_ENABLED", True)
+        self.max_results = _env_int("WIKIPEDIA_MAX_RESULTS", 5)
+        self.timeout_seconds = _env_int("WIKIPEDIA_TIMEOUT_SECONDS", WIKIPEDIA_TIMEOUT)
+        self.endpoint = "https://en.wikipedia.org/w/api.php"
+
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+
+        try:
+            response = requests.get(
+                self.endpoint,
+                params={
+                    "action": "query",
+                    "format": "json",
+                    "list": "search",
+                    "srsearch": query,
+                    "srlimit": self.max_results,
+                    "utf8": 1,
+                },
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code != 200:
+                return []
+
+            payload = response.json()
+            entries = payload.get("query", {}).get("search", [])
+            output: List[Dict[str, Any]] = []
+            for rank, item in enumerate(entries, start=1):
+                title = _clean_text(item.get("title", ""), max_chars=200)
+                snippet = _clean_text(item.get("snippet", ""), max_chars=1500)
+                url = _normalize_url(f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}")
+                output.append(
+                    {
+                        "title": title,
+                        "url": url,
+                        "content": snippet,
+                        "provider": "wikipedia",
+                        "provider_rank": rank,
+                    }
+                )
+            return output
+        except Exception as exc:
+            logger.warning("Wikipedia search failed: %s", exc)
+            return []
 
 
 class FirecrawlScraper:
     """Deep scrape URLs using Firecrawl API."""
-    
-    def __init__(self):
+
+    def __init__(self) -> None:
         self.api_key = os.getenv("FIRECRAWL_API_KEY")
-        if not self.api_key:
-            raise ValueError("FIRECRAWL_API_KEY environment variable not set")
+        self.enabled = bool(self.api_key)
+        if not self.enabled:
+            logger.warning("FIRECRAWL_API_KEY not set; deep scraping disabled")
         self.endpoint = "https://api.firecrawl.dev/v1/scrape"
-    
+        self.timeout_seconds = _env_int("FIRECRAWL_TIMEOUT_SECONDS", FIRECRAWL_TIMEOUT)
+
     def scrape_url(self, url: str) -> Dict[str, Any]:
-        """
-        Scrape a URL using Firecrawl.
-        
-        Args:
-            url: URL to scrape
-            
-        Returns:
-            Dict with scraped content and metadata
-        """
+        if not self.enabled:
+            return {"url": url, "success": False, "error": "firecrawl_disabled"}
+
         try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "url": url,
-                "formats": ["markdown", "html"],
-                "onlyMainContent": True
-            }
-            
-            print(f"[FIRECRAWL] Scraping: {url[:70]}...")
-            
-            response = requests.post(self.endpoint, json=payload, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                markdown_len = len(data.get('markdown', ''))
-                print(f"[FIRECRAWL] Success: Got {markdown_len} chars from {url[:50]}...")
-                
+            response = requests.post(
+                self.endpoint,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "url": url,
+                    "formats": ["markdown", "html"],
+                    "onlyMainContent": True,
+                },
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code != 200:
                 return {
                     "url": url,
-                    "markdown": data.get("markdown", ""),
-                    "html": data.get("html", ""),
-                    "metadata": data.get("metadata", {}),
-                    "success": True
+                    "success": False,
+                    "error": f"status_{response.status_code}",
                 }
-            else:
-                print(f"[FIRECRAWL] Status {response.status_code}: {url[:50]}...")
-                return {"url": url, "success": False, "error": f"Status {response.status_code}"}
-        except Exception as e:
-            print(f"[FIRECRAWL] Exception: {str(e)[:80]}")
-            return {"url": url, "success": False, "error": str(e)}
+
+            data = response.json()
+            return {
+                "url": url,
+                "markdown": _clean_text(data.get("markdown", ""), max_chars=8000),
+                "html": data.get("html", ""),
+                "metadata": data.get("metadata", {}),
+                "success": True,
+            }
+        except Exception as exc:
+            return {"url": url, "success": False, "error": str(exc)}
 
 
 class HybridSearcher:
-    """Combines Tavily and Firecrawl for comprehensive web search."""
-    
-    def __init__(self):
+    """Comprehensive search orchestration across multiple providers."""
+
+    def __init__(self) -> None:
         self.tavily = TavilySearcher()
+        self.serper = SerperSearcher()
+        self.duckduckgo = DuckDuckGoSearcher()
+        self.wikipedia = WikipediaSearcher()
         self.firecrawl = FirecrawlScraper()
-    
+
+        self.max_sources_to_scrape = _env_int("WEB_SCRAPE_MAX_SOURCES", 8)
+        self.max_discovered_sources = _env_int("WEB_DISCOVERED_SOURCES_LIMIT", 12)
+        self.query_variants = _env_int("WEB_QUERY_VARIANTS", 3)
+        self.extensive_mode = _env_bool("WEB_EXTENSIVE_MODE", True)
+
+        blocked_domains_raw = os.getenv(
+            "WEB_SCRAPE_BLOCKED_DOMAINS",
+            "facebook,twitter,x.com,instagram,tiktok,linkedin",
+        )
+        self.blocked_domains = {
+            token.strip().lower()
+            for token in blocked_domains_raw.split(",")
+            if token.strip()
+        }
+
+        self.provider_priority = {
+            "tavily": 1,
+            "serper": 2,
+            "duckduckgo": 3,
+            "wikipedia": 4,
+            "unknown": 5,
+        }
+
+    def _should_skip_firecrawl(self, url: str) -> bool:
+        normalized = (url or "").lower()
+        if not normalized:
+            return True
+        return any(domain in normalized for domain in self.blocked_domains)
+
+    def _build_search_queries(self, subject: str, topic: str) -> List[str]:
+        base_queries = [
+            f"{subject} {topic}",
+            f"{subject} {topic} Nigeria upstream oil and gas",
+            f"{subject} {topic} latest update 2025 2026",
+            f"{subject} {topic} reserves production operations",
+        ]
+
+        seen = set()
+        output: List[str] = []
+        for raw in base_queries:
+            normalized = " ".join(raw.split()).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            output.append(normalized)
+            if len(output) >= self.query_variants:
+                break
+        return output
+
+    def _dedupe_and_rank_sources(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+
+        for candidate in candidates:
+            url = _normalize_url(candidate.get("url"))
+            title = _clean_text(candidate.get("title", ""), max_chars=300)
+            key = url.lower() if url else title.lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            candidate["url"] = url
+            candidate["title"] = title or "Untitled source"
+            candidate["content"] = _clean_text(candidate.get("content", ""), max_chars=2400)
+            candidate["provider"] = str(candidate.get("provider") or "unknown").lower()
+            deduped.append(candidate)
+
+        deduped.sort(
+            key=lambda item: (
+                self.provider_priority.get(item.get("provider", "unknown"), 9),
+                int(item.get("provider_rank") or 999),
+            )
+        )
+        return deduped[: self.max_discovered_sources]
+
+    def _collect_discovery_sources(self, subject: str, topic: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        tavily_payload = self.tavily.search(subject, topic)
+        candidates: List[Dict[str, Any]] = list(tavily_payload.get("sources", []))
+
+        queries = self._build_search_queries(subject, topic)
+        provider_counts: Dict[str, int] = {"tavily": len(tavily_payload.get("sources", []))}
+
+        for query in queries:
+            ddg_items = self.duckduckgo.search(query)
+            if ddg_items:
+                candidates.extend(ddg_items)
+                provider_counts["duckduckgo"] = provider_counts.get("duckduckgo", 0) + len(ddg_items)
+
+            wiki_items = self.wikipedia.search(query)
+            if wiki_items:
+                candidates.extend(wiki_items)
+                provider_counts["wikipedia"] = provider_counts.get("wikipedia", 0) + len(wiki_items)
+
+            if self.extensive_mode:
+                serper_items = self.serper.search(query)
+                if serper_items:
+                    candidates.extend(serper_items)
+                    provider_counts["serper"] = provider_counts.get("serper", 0) + len(serper_items)
+
+        discovered = self._dedupe_and_rank_sources(candidates)
+        tavily_payload["provider_counts"] = provider_counts
+        return discovered, tavily_payload
+
     def search_and_scrape(self, company_name: str, topic: str) -> Dict[str, Any]:
-        """
-        Perform comprehensive search: Tavily discovery + Firecrawl deep scrape.
-        Firecrawl prioritizes Tavily's recommended sources.
-        
-        Args:
-            company_name: Company name
-            topic: What to search for (e.g., "production", "reserves", "equity")
-            
-        Returns:
-            Comprehensive search results with discovery and scraping
-        """
-        
-        print(f"[WEB_SEARCH] Starting hybrid search for {company_name} - {topic}")
-        
-        # Step 1: Use Tavily to auto-discover sources
-        tavily_results = self.tavily.search(company_name, topic)
-        num_tavily_results = tavily_results.get("num_results", 0)
-        
-        if num_tavily_results == 0:
-            print(f"[WEB_SEARCH] WARNING: Tavily found no results for {company_name} {topic}")
-        else:
-            print(f"[WEB_SEARCH] Tavily found {num_tavily_results} sources")
-        
-        scraped_sources = []
-        
-        # Step 2: Extract numeric values directly from Tavily results, use Firecrawl as supplement
-        if tavily_results.get("sources"):
-            print(f"[WEB_SEARCH] Processing {len(tavily_results['sources'])} Tavily sources")
-            
-            for i, source in enumerate(tavily_results["sources"][:5]):  # Top 5 sources
-                url = source.get("url")
-                title = source.get("title", "")
-                content = source.get("content", "")
-                
-                print(f"[WEB_SEARCH] Processing source {i+1}: {title[:50]}...")
-                
-                # Extract numeric values from Tavily snippet first (fast, reliable)
-                tavily_values = extract_numeric_values(content)
-                print(f"[WEB_SEARCH]   Tavily snippet: Found {len(tavily_values)} numeric values")
-                
-                scraped_item = {
-                    "url": url,
-                    "title": title,
-                    "snippet": content,
-                    "tavily_values": tavily_values,
-                    "rank": i + 1
-                }
-                
-                # Only scrape with Firecrawl if:
-                # 1. URL is valid and not a blocked social media site
-                # 2. We didn't find values in Tavily (to supplement)
-                skip_firecrawl = any(blocked in url.lower() for blocked in ['facebook', 'twitter', 'x.com', 'instagram']) if url else True
-                
-                if url and not skip_firecrawl:
-                    print(f"[WEB_SEARCH]   Attempting Firecrawl scrape for deeper data...")
-                    try:
-                        scraped = self.firecrawl.scrape_url(url)
-                        
-                        if scraped.get("success") and scraped.get("markdown"):
-                            # Extract values from Firecrawl markdown
-                            scraped_values = extract_numeric_values(scraped.get("markdown", ""))
-                            scraped_item["scraped_content"] = scraped.get("markdown", "")[:500]  # First 500 chars
-                            scraped_item["scraped_values"] = scraped_values
-                            scraped_item["scrape_success"] = True
-                            print(f"[WEB_SEARCH]   Firecrawl success: {len(scraped_values)} additional values")
-                        else:
-                            scraped_item["scrape_success"] = False
-                            print(f"[WEB_SEARCH]   Firecrawl: No content returned (expected for dynamic sites)")
-                    except Exception as e:
-                        scraped_item["scrape_success"] = False
-                        print(f"[WEB_SEARCH]   Firecrawl exception: {str(e)[:60]}")
-                else:
-                    scraped_item["scrape_success"] = False
-                    print(f"[WEB_SEARCH]   Skipping Firecrawl (blocked site or invalid URL)")
-                
-                scraped_sources.append(scraped_item)
-        
-        print(f"[WEB_SEARCH] Completed: {len(scraped_sources)} sources processed, {sum(1 for s in scraped_sources if s.get('tavily_values'))} with Tavily values")
-        
+        """Discover, dedupe, and deep-scrape web sources for richer evidence."""
+        target = _clean_text(company_name or "", max_chars=200) or "Nigerian upstream producers"
+        focus = _clean_text(topic or "overview", max_chars=80) or "overview"
+
+        discovered_sources, tavily_results = self._collect_discovery_sources(target, focus)
+
+        scraped_sources: List[Dict[str, Any]] = []
+        for index, source in enumerate(discovered_sources[: self.max_sources_to_scrape], start=1):
+            url = source.get("url", "")
+            snippet = _clean_text(source.get("content", ""), max_chars=2200)
+            raw_seed = _clean_text(source.get("raw_content", ""), max_chars=5000)
+            snippet_values = extract_numeric_values(f"{snippet}\n{raw_seed}")
+
+            scraped_item: Dict[str, Any] = {
+                "url": url,
+                "title": source.get("title", "Untitled source"),
+                "provider": source.get("provider", "unknown"),
+                "snippet": snippet,
+                "tavily_values": snippet_values,
+                "rank": index,
+                "scrape_success": False,
+                "scraped_values": [],
+                "scraped_content": "",
+            }
+
+            if url and not self._should_skip_firecrawl(url):
+                scraped = self.firecrawl.scrape_url(url)
+                if scraped.get("success"):
+                    markdown = _clean_text(scraped.get("markdown", ""), max_chars=5000)
+                    scraped_item["scraped_content"] = markdown
+                    scraped_item["scraped_values"] = extract_numeric_values(markdown)
+                    scraped_item["scrape_success"] = bool(markdown)
+
+            scraped_sources.append(scraped_item)
+
         return {
-            "company_name": company_name,
-            "topic": topic,
-            "tavily_summary": tavily_results.get("ai_summary", ""),
-            "tavily_results_count": num_tavily_results,
-            "discovered_sources": tavily_results.get("sources", []),
+            "company_name": target,
+            "topic": focus,
+            "tavily_summary": _clean_text(tavily_results.get("ai_summary", ""), max_chars=1200),
+            "tavily_results_count": int(tavily_results.get("num_results", 0)),
+            "provider_counts": tavily_results.get("provider_counts", {}),
+            "discovered_sources": discovered_sources,
             "scraped_sources": scraped_sources,
-            "search_timestamp": datetime.now().isoformat()
+            "search_timestamp": datetime.now().isoformat(),
         }
 
 
 def extract_numeric_values(text: str) -> List[Tuple[float, str]]:
-    """Extract numeric values and their context from text."""
-    import re
-    
-    # Regex patterns for common metrics
+    """Extract common quantitative metrics from unstructured web text."""
     patterns = {
-        "production": r"(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:bopd|barrel|BPD|BOPD)",
-        "reserves": r"(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:mmbbl|MMBbl|billion barrels)",
-        "equity": r"(\d+(?:\.\d+)?)\s*%"
+        "production": r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:bopd|bpd|barrels?\s+per\s+day)",
+        "reserves": r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:mmbbl|mmbbls|million\s+barrels|billion\s+barrels)",
+        "equity": r"(\d+(?:\.\d+)?)\s*%",
+        "revenue": r"\$\s?(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:million|billion)?",
     }
-    
-    values = []
-    for pattern_name, pattern in patterns.items():
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
-            # Clean number
-            num_str = match.replace(",", "")
+
+    values: List[Tuple[float, str]] = []
+    haystack = text or ""
+    for metric, pattern in patterns.items():
+        for raw_value in re.findall(pattern, haystack, flags=re.IGNORECASE):
+            value_text = str(raw_value).replace(",", "").strip()
             try:
-                num = float(num_str)
-                values.append((num, pattern_name))
+                values.append((float(value_text), metric))
             except ValueError:
-                pass
-    
+                continue
     return values
 
 
@@ -297,86 +568,128 @@ def synthesize_web_results(
     company_name: str,
     database_data: Dict[str, Any],
     web_results: Dict[str, Any],
-    topic: str
+    topic: str,
 ) -> Dict[str, Any]:
-    """
-    Synthesize database data and web search results.
-    
-    Returns data ranges with sources.
-    Extracts data from Tavily first, then supplements with Firecrawl if available.
-    """
-    
-    synthesis = {
+    """Build structured and cleaned evidence bundles for final LLM synthesis."""
+    synthesis: Dict[str, Any] = {
         "company_name": company_name,
         "topic": topic,
         "sources": [],
         "data_points": [],
-        "synthesis": ""
+        "source_briefs": [],
+        "synthesis": "",
     }
-    
-    # Add database source
-    if database_data:
+
+    if isinstance(database_data, dict) and database_data:
         for key, value in database_data.items():
-            if value and value != "NOT_AVAILABLE":
-                synthesis["data_points"].append({
-                    "source": "Database",
-                    "metric": key,
-                    "value": value,
-                    "priority": 1  # Database is trusted source
-                })
-        
-        synthesis["sources"].append({
-            "name": "Internal Database",
-            "type": "database",
-            "timestamp": None
-        })
-    
-    # Extract data from Tavily results (most reliable)
-    for scraped in web_results.get("scraped_sources", []):
-        tavily_vals = scraped.get("tavily_values", [])
-        
-        for value, metric_type in tavily_vals:
-            synthesis["data_points"].append({
-                "source": scraped.get("title", "Tavily Result"),
-                "url": scraped.get("url"),
-                "metric": metric_type,
-                "value": value,
-                "priority": 2  # Tavily snippets are reliable
-            })
-        
-        # Add source if Tavily found values
-        if tavily_vals:
-            synthesis["sources"].append({
-                "name": scraped.get("title", "Unknown"),
-                "url": scraped.get("url"),
-                "type": "tavily",
-                "rank": scraped.get("rank")
-            })
-    
-    # Supplement with Firecrawl data if scraping was successful
-    for scraped in web_results.get("scraped_sources", []):
-        if scraped.get("scrape_success"):
-            scraped_vals = scraped.get("scraped_values", [])
-            
-            for value, metric_type in scraped_vals:
-                # Only add if not already from Tavily
-                existing = [p for p in synthesis["data_points"] 
-                           if p["metric"] == metric_type and p["source"] == scraped.get("title")]
-                if not existing:
-                    synthesis["data_points"].append({
-                        "source": scraped.get("title", "Unknown"),
-                        "url": scraped.get("url"),
-                        "metric": metric_type,
+            if value not in {None, "", "NOT_AVAILABLE"}:
+                synthesis["data_points"].append(
+                    {
+                        "source": "Internal Database",
+                        "metric": key,
                         "value": value,
-                        "priority": 3
-                    })
-    
+                        "priority": 1,
+                    }
+                )
+        synthesis["sources"].append(
+            {
+                "name": "Internal Database",
+                "url": None,
+                "type": "database",
+            }
+        )
+
+    brief_seen = set()
+
+    discovered_sources = web_results.get("discovered_sources", []) if isinstance(web_results, dict) else []
+    for source in discovered_sources[:20]:
+        provider = str(source.get("provider", "unknown")).lower()
+        title = _clean_text(source.get("title", ""), max_chars=220)
+        url = _normalize_url(source.get("url"))
+        snippet = _clean_text(source.get("content", ""), max_chars=800)
+        if not (title or snippet):
+            continue
+
+        synthesis["sources"].append(
+            {
+                "name": title or "Unknown",
+                "url": url,
+                "type": provider,
+            }
+        )
+
+        brief_key = (url.lower() if url else title.lower()) + "|snippet"
+        if brief_key not in brief_seen and snippet:
+            brief_seen.add(brief_key)
+            synthesis["source_briefs"].append(
+                {
+                    "title": title or "Unknown",
+                    "url": url,
+                    "provider": provider,
+                    "text": snippet,
+                }
+            )
+
+    scraped_sources = web_results.get("scraped_sources", []) if isinstance(web_results, dict) else []
+    for scraped in scraped_sources:
+        title = _clean_text(scraped.get("title", ""), max_chars=220)
+        url = _normalize_url(scraped.get("url"))
+        provider = str(scraped.get("provider", "unknown")).lower()
+
+        for value, metric_type in scraped.get("tavily_values", []) or []:
+            synthesis["data_points"].append(
+                {
+                    "source": title or provider,
+                    "url": url,
+                    "metric": metric_type,
+                    "value": value,
+                    "priority": 2,
+                }
+            )
+
+        for value, metric_type in scraped.get("scraped_values", []) or []:
+            synthesis["data_points"].append(
+                {
+                    "source": title or provider,
+                    "url": url,
+                    "metric": metric_type,
+                    "value": value,
+                    "priority": 3,
+                }
+            )
+
+        deep_text = _clean_text(scraped.get("scraped_content", ""), max_chars=1500)
+        if deep_text:
+            synthesis["sources"].append(
+                {
+                    "name": title or "Unknown",
+                    "url": url,
+                    "type": "firecrawl",
+                }
+            )
+
+            brief_key = (url.lower() if url else title.lower()) + "|scraped"
+            if brief_key not in brief_seen:
+                brief_seen.add(brief_key)
+                synthesis["source_briefs"].append(
+                    {
+                        "title": title or "Unknown",
+                        "url": url,
+                        "provider": "firecrawl",
+                        "text": deep_text,
+                    }
+                )
+
+    summary_parts: List[str] = []
+    tavily_summary = _clean_text(web_results.get("tavily_summary", ""), max_chars=1000)
+    if tavily_summary:
+        summary_parts.append(tavily_summary)
+
+    for brief in synthesis["source_briefs"][:8]:
+        summary_parts.append(f"{brief['title']}: {brief['text']}")
+
+    synthesis["synthesis"] = _clean_text("\n\n".join(summary_parts), max_chars=10000)
     return synthesis
 
 
-# Initialize if needed
-try:
-    hybrid_searcher = HybridSearcher()
-except ValueError as e:
-    print(f"Warning: Web search initialization failed: {e}")
-    hybrid_searcher = None
+hybrid_searcher = HybridSearcher()

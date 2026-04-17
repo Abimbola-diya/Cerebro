@@ -9,3 +9,7 @@ requests==2.31.0
 cerebras-cloud-sdk==1.67.0
 tavily-python==0.3.1
 firecrawl-py==4.22.2
+duckduckgo-search==8.1.1
+langchain==1.2.15
+langchain-community==0.4.1
+langchain-openai==1.1.14
