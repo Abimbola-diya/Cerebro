@@ -207,6 +207,7 @@ class SerperSearcher:
         self.api_key = os.getenv("SERPER_API_KEY", "").strip()
         self.enabled = bool(self.api_key)
         self.max_results = _env_int("SERPER_MAX_RESULTS", 6)
+        self.include_news = _env_bool("SERPER_INCLUDE_NEWS", True)
         self.timeout_seconds = _env_int("SERPER_TIMEOUT_SECONDS", SERPER_TIMEOUT)
         self.endpoint = "https://google.serper.dev/search"
 
@@ -241,6 +242,19 @@ class SerperSearcher:
                         "provider_rank": rank,
                     }
                 )
+
+            if self.include_news:
+                news_items = payload.get("news", [])
+                for offset, item in enumerate(news_items, start=1):
+                    normalized.append(
+                        {
+                            "title": _clean_text(item.get("title", ""), max_chars=300),
+                            "url": _normalize_url(item.get("link")),
+                            "content": _clean_text(item.get("snippet", ""), max_chars=1800),
+                            "provider": "serper",
+                            "provider_rank": len(organic) + offset,
+                        }
+                    )
             return normalized
         except Exception as exc:
             logger.warning("Serper search failed: %s", exc)
@@ -397,6 +411,7 @@ class HybridSearcher:
         self.max_discovered_sources = _env_int("WEB_DISCOVERED_SOURCES_LIMIT", 12)
         self.query_variants = _env_int("WEB_QUERY_VARIANTS", 3)
         self.extensive_mode = _env_bool("WEB_EXTENSIVE_MODE", True)
+        self.serper_always_on = _env_bool("SERPER_ALWAYS_ON", True)
 
         blocked_domains_raw = os.getenv(
             "WEB_SCRAPE_BLOCKED_DOMAINS",
@@ -465,7 +480,19 @@ class HybridSearcher:
                 int(item.get("provider_rank") or 999),
             )
         )
-        return deduped[: self.max_discovered_sources]
+
+        limited = deduped[: self.max_discovered_sources]
+
+        # Keep at least one Serper source in the trimmed set when Serper produced results.
+        has_serper_overall = any(str(item.get("provider", "")).lower() == "serper" for item in deduped)
+        has_serper_limited = any(str(item.get("provider", "")).lower() == "serper" for item in limited)
+        if has_serper_overall and not has_serper_limited and limited:
+            first_serper = next(
+                item for item in deduped if str(item.get("provider", "")).lower() == "serper"
+            )
+            limited[-1] = first_serper
+
+        return limited
 
     def _collect_discovery_sources(self, subject: str, topic: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         tavily_payload = self.tavily.search(subject, topic)
@@ -485,7 +512,7 @@ class HybridSearcher:
                 candidates.extend(wiki_items)
                 provider_counts["wikipedia"] = provider_counts.get("wikipedia", 0) + len(wiki_items)
 
-            if self.extensive_mode:
+            if self.extensive_mode or self.serper_always_on:
                 serper_items = self.serper.search(query)
                 if serper_items:
                     candidates.extend(serper_items)
@@ -582,7 +609,19 @@ def synthesize_web_results(
 
     if isinstance(database_data, dict) and database_data:
         for key, value in database_data.items():
-            if value not in {None, "", "NOT_AVAILABLE"}:
+            if value is None:
+                continue
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped or stripped == "NOT_AVAILABLE":
+                    continue
+
+            # Keep structured values (lists/dicts) because they can be useful evidence.
+            # This check avoids unhashable-type crashes from set-membership filters.
+            if isinstance(value, (list, dict)) and not value:
+                continue
+
+            if value is not None:
                 synthesis["data_points"].append(
                     {
                         "source": "Internal Database",

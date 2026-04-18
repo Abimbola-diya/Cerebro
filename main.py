@@ -16,16 +16,17 @@ import uuid
 import time
 import logging
 import re
-from typing import Optional, List
+from typing import Optional, List, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator, ConfigDict
+from pydantic import BaseModel, validator, ConfigDict, Field
 import uvicorn
 
 from database import db
 from llm import llm_pipeline
 from keepalive import keepalive_service
 from session import session_manager
+from upstream_intelligence import generate_upstream_dashboard
 
 # Configure logging
 logging.basicConfig(
@@ -146,6 +147,150 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     llm: str
+
+
+class UpstreamLensWeights(BaseModel):
+    """Lens weighting controls for dashboard emphasis."""
+
+    finance: float = 20.0
+    volume: float = 20.0
+    economics: float = 20.0
+    risk: float = 20.0
+    geopolitics: float = 10.0
+    operations: float = 10.0
+
+    @validator("*", pre=True)
+    def validate_weight(cls, value):
+        weight = float(value)
+        if weight < 0:
+            raise ValueError("Lens weights must be non-negative")
+        if weight > 1000:
+            raise ValueError("Lens weights are unrealistically high")
+        return weight
+
+
+class UpstreamIntelligenceRequest(BaseModel):
+    """Request contract for upstream dashboard synthesis route."""
+
+    scope: str = "upstream_nigeria"
+    lens_weights: UpstreamLensWeights
+    focus_strength: float = 65.0
+    include: List[str] = ["global", "nigeria", "cost_curves", "yield_breakdown", "nuances"]
+
+    @validator("scope")
+    def validate_scope(cls, value: str) -> str:
+        clean = value.strip().lower()
+        if clean not in {"upstream_nigeria", "upstream", "nigeria_upstream"}:
+            raise ValueError("scope must be one of: upstream_nigeria, upstream, nigeria_upstream")
+        return clean
+
+    @validator("focus_strength")
+    def validate_focus_strength(cls, value: float) -> float:
+        if value < 0 or value > 100:
+            raise ValueError("focus_strength must be between 0 and 100")
+        return float(value)
+
+    @validator("include")
+    def validate_include(cls, value: List[str]) -> List[str]:
+        allowed = {"global", "nigeria", "cost_curves", "yield_breakdown", "nuances"}
+        if not value:
+            return ["global", "nigeria", "cost_curves", "yield_breakdown", "nuances"]
+        cleaned: List[str] = []
+        for item in value:
+            key = str(item).strip().lower()
+            if key not in allowed:
+                raise ValueError(f"Unsupported include key: {item}")
+            if key not in cleaned:
+                cleaned.append(key)
+        return cleaned
+
+
+class UpstreamTopProducer(BaseModel):
+    name: str
+    code: str
+    value: float
+    share: float
+
+
+class UpstreamGlobalProductionMetric(BaseModel):
+    value: float
+    unit: str
+    context: str
+    trendText: str
+    topProducers: List[UpstreamTopProducer] = Field(min_length=1)
+    series: List[float] = Field(min_length=6)
+
+
+class UpstreamBrentSpotPriceMetric(BaseModel):
+    value: float
+    unit: str
+    context: str
+    trendText: str
+    rangeLow: float
+    rangeHigh: float
+    alert: str
+    series: List[float] = Field(min_length=6)
+
+
+class UpstreamBarrelYieldMetric(BaseModel):
+    name: str
+    value: float
+    unit: str
+    sharePct: float
+    note: str
+
+
+class UpstreamReservesMetric(BaseModel):
+    value: float
+    unit: str
+    yearsOfSupply: int
+    context: str
+    topHolders: List[str] = Field(min_length=1)
+    series: List[float] = Field(min_length=6)
+
+
+class UpstreamBreakEvenMetric(BaseModel):
+    region: str
+    min: float
+    max: float
+
+
+class UpstreamNigeriaPulseMetric(BaseModel):
+    productionBpd: int
+    upstreamCapacityBpd: int
+    refineryThroughputBpd: int
+    pmsDemandBpd: int
+    context: str
+    bottleneck: str
+    series: List[float] = Field(min_length=6)
+
+
+class UpstreamNuanceMetric(BaseModel):
+    title: str
+    detail: str
+    severity: Literal["watch", "elevated", "critical"]
+
+
+class UpstreamMetrics(BaseModel):
+    globalProduction: UpstreamGlobalProductionMetric
+    brentSpotPrice: UpstreamBrentSpotPriceMetric
+    barrelYields: List[UpstreamBarrelYieldMetric] = Field(min_length=1)
+    reserves: UpstreamReservesMetric
+    breakEvenByRegion: List[UpstreamBreakEvenMetric] = Field(min_length=1)
+    nigeriaPulse: UpstreamNigeriaPulseMetric
+
+
+class UpstreamDashboardResponse(BaseModel):
+    dashboardTitle: str
+    generatedAt: str
+    summary: str
+    dominantLens: Literal["finance", "volume", "economics", "risk", "geopolitics", "operations"]
+    metrics: UpstreamMetrics
+    nuances: List[UpstreamNuanceMetric] = Field(min_length=1)
+
+
+class UpstreamIntelligenceResponse(BaseModel):
+    dashboard: UpstreamDashboardResponse
 
 # --- Endpoints ---
 
@@ -393,6 +538,43 @@ def ask_question_debug(request: QueryRequest):
             status_code=500,
             detail="An unexpected error occurred in debug pipeline."
         )
+
+
+@app.post("/api/upstream/intelligence", response_model=UpstreamIntelligenceResponse)
+async def upstream_intelligence_dashboard(request: UpstreamIntelligenceRequest):
+    """
+    Build upstream intelligence dashboard payload for the frontend contract.
+    Always returns a stable dashboard shape under {"dashboard": ...}.
+    """
+
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+    time_budget_seconds = max(20, int(os.getenv("UPSTREAM_INTEL_TIMEOUT_SECONDS", "180")))
+
+    try:
+        dashboard = await asyncio.to_thread(
+            generate_upstream_dashboard,
+            scope=request.scope,
+            lens_weights=request.lens_weights.model_dump(),
+            focus_strength=request.focus_strength,
+            include=request.include,
+            llm_pipeline=llm_pipeline,
+            time_budget_seconds=time_budget_seconds,
+        )
+    except Exception as exc:
+        logger.error("[%s] Upstream dashboard failed: %s", request_id, exc, exc_info=True)
+        dashboard = generate_upstream_dashboard(
+            scope=request.scope,
+            lens_weights=request.lens_weights.model_dump(),
+            focus_strength=request.focus_strength,
+            include=request.include,
+            llm_pipeline=None,
+            skip_research=True,
+        )
+
+    elapsed = time.time() - start_time
+    logger.info("[%s] Upstream intelligence response ready in %.2fs", request_id, elapsed)
+    return {"dashboard": dashboard}
 
 @app.get("/api/entities", response_model=EntityListResponse)
 async def list_entities(entity_type: str = "UpstreamProducer"):
