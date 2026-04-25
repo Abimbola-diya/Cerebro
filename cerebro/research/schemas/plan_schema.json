@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Research Plan",
+  "type": "object",
+  "required": [
+    "query",
+    "thinking",
+    "research_plan",
+    "execution_order",
+    "anticipated_gaps",
+    "context_notes"
+  ],
+  "properties": {
+    "query": {"type": "string"},
+    "entity_id": {"type": ["string", "null"]},
+    "entity_name": {"type": ["string", "null"]},
+    "thinking": {"type": "string"},
+    "research_plan": {"type": "object"},
+    "execution_order": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "anticipated_gaps": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "context_notes": {"type": "string"}
+  }
+}

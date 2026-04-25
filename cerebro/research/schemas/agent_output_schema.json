@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Output Item",
+  "type": "object",
+  "required": [
+    "dimension",
+    "source_id",
+    "source_url",
+    "provider",
+    "content"
+  ],
+  "properties": {
+    "dimension": {"type": "string"},
+    "source_id": {"type": "string"},
+    "source_name": {"type": "string"},
+    "source_type": {"type": ["string", "null"]},
+    "source_url": {"type": "string"},
+    "provider": {"type": "string"},
+    "task_type": {"type": "string"},
+    "query": {"type": ["string", "null"]},
+    "title": {"type": ["string", "null"]},
+    "content": {"type": "string"},
+    "published_date": {"type": ["string", "null"]},
+    "score": {"type": ["number", "null"]}
+  }
+}
