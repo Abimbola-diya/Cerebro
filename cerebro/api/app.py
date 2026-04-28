@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI
@@ -326,16 +328,78 @@ def create_app() -> FastAPI:
         )
 
         retrieval_summary = _build_retrieval_summary(agent_results=agent_results)
+        evidence_quality = _compute_evidence_quality_score(
+            agent_results=agent_results, plan=plan,
+        )
+
+        # Extract synthesis output for clean API contract
+        synth_output = synthesis_result.get("synthesis_output", {})
+        evidence_summary = synthesis_result.get("evidence_summary", {})
 
         return {
             "request_id": working_state.request_id,
+            "query": request.query,
+            "entity_name": request.entity_name or plan.get("entity_name", ""),
+
+            # Pre-rendered for immediate display
+            "rendered_report": synth_output.get("rendered_report", ""),
+
+            # Structured report data for frontend rendering
+            "report": {
+                "status": synth_output.get("status", "PARTIAL"),
+                "executive_summary": synth_output.get("executive_summary", ""),
+                "detailed_analysis": synth_output.get("brief", ""),
+                "one_paragraph_summary": synth_output.get("one_paragraph_summary", ""),
+                "key_findings": synth_output.get("key_findings", []),
+                "key_data_points": synth_output.get("key_data_points", []),
+                "timeline": synth_output.get("timeline", []),
+                "risk_assessment": synth_output.get("risk_register", []),
+                "forward_indicators": synth_output.get("forward_indicators", []),
+                "key_tensions": synth_output.get("key_tensions", []),
+                "confidence": {
+                    **(synth_output.get("confidence_assessment") or {}),
+                    "evidence_quality_score": evidence_quality.get("composite_score", 0.0),
+                },
+                "contradictions": synth_output.get("contradiction_notes", []),
+                "methodology_note": synth_output.get("methodology_note", ""),
+            },
+
+            # Citation infrastructure
+            "sources": synth_output.get("source_appendix", []),
+
+            # Claims with full source resolution
+            "claims": synth_output.get("claims", []),
+
+            # Research methodology transparency
+            "methodology": {
+                "dimensions_searched": len(plan.get("research_plan", {})),
+                "dimensions_active": len(evidence_summary.get("active_dimensions", [])),
+                "total_sources_consulted": evidence_summary.get("unique_sources", 0),
+                "documents_retrieved": evidence_summary.get("total_documents_retrieved", 0),
+                "documents_used_in_synthesis": evidence_summary.get("documents_used_in_synthesis", 0),
+                "unique_domains": retrieval_summary.get("unique_domains", 0),
+                "search_providers": retrieval_summary.get("providers_used", []),
+            },
+
+            # Actionable next steps
+            "suggested_follow_ups": synth_output.get("suggested_follow_ups", []),
+
+            # Related entities discovered during research
+            "related_entities": synth_output.get("related_entities", []),
+
+            # Diagnostics
+            "diagnostics": {
+                "evidence_thresholds": threshold_check,
+                "evidence_quality": evidence_quality,
+                "warnings": warnings,
+                "retrieval_summary": retrieval_summary,
+                "working_files": sorted(working_state.files.keys()),
+            },
+
+            # Keep raw data for backward compatibility
             "plan": plan,
             "agent_results": agent_results,
             "synthesis": synthesis_result,
-            "evidence_diagnostics": threshold_check,
-            "warnings": warnings,
-            "retrieval_summary": retrieval_summary,
-            "working_files": sorted(working_state.files.keys()),
         }
 
     return app
@@ -385,10 +449,91 @@ def _evaluate_evidence_thresholds(plan: dict[str, Any], agent_results: dict[str,
     }
 
 
+def _compute_evidence_quality_score(
+    agent_results: dict[str, Any], plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute a composite evidence quality score (0-1.0) from multiple factors."""
+    all_docs: list[dict[str, Any]] = []
+    domains: set[str] = set()
+    providers: set[str] = set()
+    recent_count = 0
+    high_credibility_count = 0
+    dimensions_with_docs = 0
+
+    for _dim, result in (agent_results or {}).items():
+        if not isinstance(result, dict):
+            continue
+        docs = result.get("documents") or []
+        if not isinstance(docs, list):
+            continue
+        valid = [d for d in docs if isinstance(d, dict) and str(d.get("content", "")).strip()]
+        if valid:
+            dimensions_with_docs += 1
+        all_docs.extend(valid)
+
+        for doc in valid:
+            url = str(doc.get("url") or doc.get("source") or "")
+            if url:
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc
+                    if domain:
+                        domains.add(domain)
+                except Exception:
+                    pass
+
+            provider = str(doc.get("provider") or doc.get("retrieval_provider") or "")
+            if provider:
+                providers.add(provider)
+
+            # Check recency (< 90 days)
+            date_str = str(doc.get("published_date") or doc.get("date") or "")
+            if date_str:
+                try:
+                    pub = datetime.fromisoformat(date_str[:10])
+                    if (datetime.now() - pub).days < 90:
+                        recent_count += 1
+                except Exception:
+                    pass
+
+    total = len(all_docs) or 1
+
+    # Factor 1: Source diversity (unique domains / total docs, capped at 1.0)
+    diversity_score = min(1.0, len(domains) / max(total * 0.5, 1))
+
+    # Factor 2: Recency (% of docs from last 90 days)
+    recency_score = recent_count / total
+
+    # Factor 3: Cross-dimension coverage (dimensions with docs / total dimensions)
+    total_dims = len(plan.get("research_plan", {})) or 7
+    coverage_score = dimensions_with_docs / total_dims
+
+    # Factor 4: Volume adequacy (smooth curve, 20+ docs = 1.0)
+    volume_score = min(1.0, total / 20)
+
+    # Composite: weighted average
+    composite = (
+        diversity_score * 0.25
+        + recency_score * 0.25
+        + coverage_score * 0.30
+        + volume_score * 0.20
+    )
+
+    return {
+        "composite_score": round(composite, 3),
+        "source_diversity": {"unique_domains": len(domains), "score": round(diversity_score, 3)},
+        "recency": {"recent_docs": recent_count, "total_docs": total, "score": round(recency_score, 3)},
+        "dimension_coverage": {"active": dimensions_with_docs, "total": total_dims, "score": round(coverage_score, 3)},
+        "volume": {"total_docs": total, "score": round(volume_score, 3)},
+    }
+
+
 def _build_retrieval_summary(agent_results: dict[str, Any]) -> dict[str, Any]:
     documents_preview: list[dict[str, Any]] = []
     per_dimension_counts: dict[str, int] = {}
     total_documents = 0
+    all_domains: set[str] = set()
+    all_providers: set[str] = set()
 
     for dimension, result in agent_results.items():
         if not isinstance(result, dict):
@@ -403,14 +548,28 @@ def _build_retrieval_summary(agent_results: dict[str, Any]) -> dict[str, Any]:
         total_documents += len(valid_docs)
 
         for item in valid_docs:
+            # Track domains and providers
+            url = str(item.get("url") or item.get("source") or "")
+            if url:
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc
+                    if domain:
+                        all_domains.add(domain)
+                except Exception:
+                    pass
+            provider = str(item.get("provider") or item.get("retrieval_provider") or "")
+            if provider:
+                all_providers.add(provider)
+
             if len(documents_preview) >= 12:
-                break
+                continue
             documents_preview.append(
                 {
                     "dimension": dimension,
                     "title": item.get("title"),
-                    "url": item.get("url") or item.get("source"),
-                    "provider": item.get("provider") or item.get("retrieval_provider"),
+                    "url": url,
+                    "provider": provider,
                     "retrieval_method": item.get("retrieval_method"),
                     "content_snippet": str(item.get("content") or "")[:240],
                 }
@@ -418,6 +577,8 @@ def _build_retrieval_summary(agent_results: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "total_documents": total_documents,
+        "unique_domains": len(all_domains),
+        "providers_used": sorted(all_providers),
         "per_dimension_counts": per_dimension_counts,
         "documents_preview": documents_preview,
     }

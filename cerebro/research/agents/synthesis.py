@@ -35,11 +35,24 @@ def _doc_sort_key(doc: dict[str, Any], dim_key: str) -> float:
     return base
 
 
-def _strip_inline_citations(text: str) -> str:
+def _normalize_inline_citations(text: str, source_count: int) -> str:
+    """Preserve valid [N] citations, strip legacy dimension-style references."""
+    # Strip legacy dimension-style citations that the old prompt produced
     text = re.sub(r"\s*\(dimension_\w+(?:[^)]*source[_\s]id[s]?[\s:]*[\d,\s]*)?\)", "", text)
     text = re.sub(r"\s*\[dimension_\w+[^\]]*\]", "", text)
-    text = re.sub(r",?\s*sources?\s+[\d,\s\-]+", "", text)
     text = re.sub(r"\s*source[_\s]id[s]?[\s:]*[\d,\s]+", "", text)
+
+    # Validate [N] citations: keep valid ones, strip invalid ones
+    def _validate_citation(match: re.Match[str]) -> str:
+        try:
+            n = int(match.group(1))
+            if 0 <= n < source_count:
+                return f"[{n}]"
+        except (ValueError, TypeError):
+            pass
+        return ""
+
+    text = re.sub(r"\[(\d+)\]", _validate_citation, text)
     text = re.sub(r"  +", " ", text)
     return text.strip()
 
@@ -61,17 +74,20 @@ class SynthesisOutput(TypedDict):
     status: str
     brief: str
     one_paragraph_summary: str
+    executive_summary: str
+    key_findings: list[dict[str, Any]]
+    key_data_points: list[dict[str, Any]]
+    timeline: list[dict[str, Any]]
     key_tensions: list[dict[str, Any]]
     risk_register: list[dict[str, Any]]
     forward_indicators: list[dict[str, Any]]
     confidence_assessment: dict[str, Any]
     claims: list[dict[str, Any]]
-    executive_summary: str
-    key_findings: list[dict[str, Any]]
-    risk_factors: list[dict[str, Any]]
-    recommendations: list[str]
-    unresolved_gaps: list[str]
-    contradiction_notes: list[str]
+    contradiction_notes: list[dict[str, Any]]
+    suggested_follow_ups: list[str]
+    related_entities: list[dict[str, Any]]
+    methodology_note: str
+    rendered_report: str
     source_appendix: list[dict[str, Any]]
 
 
@@ -165,22 +181,39 @@ class ResearchSynthesizer:
         self,
         evidence_pack: dict[str, Any],
         agent_results: dict[str, dict[str, Any]],
-        max_per_dimension: int = 6,
-        content_chars: int = 600,
+        max_per_dimension: int = 8,
+        content_chars: int = 800,
     ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
-        """Build a compressed, model-readable evidence bundle and source index."""
+        """Build a compressed, model-readable evidence bundle and source index.
+
+        High-credibility sources (rank 4-5) get more content space to improve
+        the synthesis model's ability to cite specific facts.
+        """
         del evidence_pack  # Bundle is built from agent_results documents by design.
 
         source_index: list[dict[str, Any]] = []
         url_to_source_id: dict[str, int] = {}
 
-        def register_source(url: str, title: str, provider: str, date: str) -> int | None:
+        # Build a lookup from source_id string -> SourceRecord for credibility data
+        from cerebro.research.sources.registry import registry as _source_registry
+        _source_by_id = {rec.id: rec for rec in _source_registry.all()}
+
+        def register_source(
+            url: str, title: str, provider: str, date: str,
+            source_id_str: str = "", dimension: str = "",
+        ) -> int | None:
             key = url.strip() if isinstance(url, str) else ""
             if not key:
                 return None
             if key in url_to_source_id:
                 return url_to_source_id[key]
             sid = len(source_index)
+
+            # Look up credibility from source bank
+            source_rec = _source_by_id.get(source_id_str)
+            credibility_rank = source_rec.credibility_rank if source_rec else 2
+            source_tier = source_rec.tier.value if source_rec else "unknown"
+
             source_index.append(
                 {
                     "id": sid,
@@ -188,6 +221,9 @@ class ResearchSynthesizer:
                     "title": (title or "")[:120],
                     "provider": provider or "unknown",
                     "date": date or "",
+                    "credibility_rank": credibility_rank,
+                    "source_tier": source_tier,
+                    "dimension": dimension,
                 }
             )
             url_to_source_id[key] = sid
@@ -221,12 +257,22 @@ class ResearchSynthesizer:
                 provider = str(doc.get("provider") or doc.get("retrieval_provider") or "")
                 date = str(doc.get("published_date") or doc.get("date") or "")
                 content = str(doc.get("content") or "").strip()
+                doc_source_id = str(doc.get("source_id") or "")
 
-                if len(content) > content_chars:
-                    clipped = content[:content_chars]
+                # High-credibility sources get more content space
+                source_rec = _source_by_id.get(doc_source_id)
+                doc_rank = source_rec.credibility_rank if source_rec else 2
+                effective_chars = 1500 if doc_rank >= 4 else content_chars
+
+                if len(content) > effective_chars:
+                    clipped = content[:effective_chars]
                     content = clipped.rsplit(" ", 1)[0] + "..."
 
-                sid = register_source(url, title, provider, date)
+                sid = register_source(
+                    url, title, provider, date,
+                    source_id_str=doc_source_id,
+                    dimension=dim_key,
+                )
 
                 dim_entries.append(
                     {
@@ -234,6 +280,8 @@ class ResearchSynthesizer:
                         "title": title[:120],
                         "url": url,
                         "published_date": date,
+                        "credibility_rank": doc_rank,
+                        "dimension": dim_key,
                         "content": content,
                     }
                 )
@@ -274,7 +322,7 @@ class ResearchSynthesizer:
             os.environ.get("NVIDIA_MODEL", "nvidia/llama-3.3-nemotron-super-49b-v1"),
         )
         temperature = float(os.environ.get("NVIDIA_SYNTHESIS_TEMPERATURE", "0.4"))
-        max_tokens = int(os.environ.get("NVIDIA_SYNTHESIS_MAX_TOKENS", "6000"))
+        max_tokens = int(os.environ.get("NVIDIA_SYNTHESIS_MAX_TOKENS", "10000"))
 
         if self._synthesis_model is None:
             self._synthesis_model = ChatOpenAI(
@@ -295,14 +343,20 @@ REQUEST ID: {request_id}
 EVIDENCE BY DIMENSION:
 {json.dumps(dimensions_bundle, ensure_ascii=False, indent=2)}
 
-SOURCE INDEX (use these integer IDs in source_ids fields):
+SOURCE INDEX (use these integer IDs for inline citations [N] and in source_ids arrays):
 {json.dumps(source_index, ensure_ascii=False, indent=2)}
 
-INSTRUCTIONS REMINDER:
+CRITICAL CITATION INSTRUCTIONS:
+- In brief, executive_summary, and one_paragraph_summary: cite every factual claim with [N] where N is the source_id from the SOURCE INDEX above
+- In claims, key_findings, key_data_points, timeline, risk_register, forward_indicators, key_tensions, contradiction_notes: include source_ids arrays
+- If a source has credibility_rank 4-5, it should be weighted more heavily
 - Write the executive_summary in your own analytical voice
-- Do not copy document text verbatim into claims
+- Do not copy document text verbatim
 - Identify cross-dimension patterns and corroboration
-- Flag contradictions between sources
+- Flag contradictions between sources in contradiction_notes
+- Generate 3-5 suggested_follow_ups based on gaps and emerging themes
+- Identify 3-8 related_entities mentioned frequently across the evidence
+- Write a methodology_note summarising the research scope
 - Return valid JSON only matching the schema above
 """
 
@@ -363,25 +417,15 @@ INSTRUCTIONS REMINDER:
         output: dict[str, Any],
         source_index: list[dict[str, Any]],
     ) -> SynthesisOutput:
-        """Normalize model output to the canonical synthesis schema without fake fallbacks."""
+        """Normalize model output to the canonical synthesis schema.
+
+        Preserves valid inline citations [N], resolves source references in claims,
+        and generates a pre-rendered Markdown report.
+        """
+        source_count = len(source_index)
+
         if not isinstance(output, dict):
-            return {
-                "status": "FAILED",
-                "brief": "Model did not return a valid object.",
-                "one_paragraph_summary": "",
-                "key_tensions": [],
-                "risk_register": [],
-                "forward_indicators": [],
-                "confidence_assessment": {},
-                "claims": [],
-                "executive_summary": "",
-                "key_findings": [],
-                "risk_factors": [],
-                "recommendations": [],
-                "unresolved_gaps": [],
-                "contradiction_notes": [],
-                "source_appendix": self._source_appendix(source_index),
-            }
+            return self._empty_synthesis_output(source_index)
 
         status = str(output.get("status") or "PARTIAL").upper()
         if status not in {"COMPLETE", "PARTIAL", "FAILED"}:
@@ -395,6 +439,36 @@ INSTRUCTIONS REMINDER:
         def to_list(value: Any) -> list[Any]:
             return value if isinstance(value, list) else []
 
+        def normalize_source_ids(raw_ids: Any) -> list[int]:
+            result: list[int] = []
+            for sid in (raw_ids or []):
+                if isinstance(sid, int) and 0 <= sid < source_count:
+                    result.append(sid)
+                elif isinstance(sid, str) and sid.isdigit() and int(sid) < source_count:
+                    result.append(int(sid))
+            return result
+
+        def resolve_source_urls(sids: list[int]) -> list[str]:
+            return [
+                source_index[idx].get("url", "")
+                for idx in sids
+                if 0 <= idx < source_count
+            ]
+
+        def resolve_sources(sids: list[int]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": idx,
+                    "url": source_index[idx].get("url", ""),
+                    "title": source_index[idx].get("title", ""),
+                    "provider": source_index[idx].get("provider", ""),
+                    "date": source_index[idx].get("date", ""),
+                }
+                for idx in sids
+                if 0 <= idx < source_count
+            ]
+
+        # --- Claims ---
         claims: list[dict[str, Any]] = []
         for claim in to_list(output.get("claims")):
             if not isinstance(claim, dict):
@@ -403,12 +477,7 @@ INSTRUCTIONS REMINDER:
             if not text:
                 continue
 
-            normalized_source_ids: list[int] = []
-            for sid in claim.get("source_ids") or []:
-                if isinstance(sid, int) and 0 <= sid < len(source_index):
-                    normalized_source_ids.append(sid)
-                elif isinstance(sid, str) and sid.isdigit() and int(sid) < len(source_index):
-                    normalized_source_ids.append(int(sid))
+            normalized_sids = normalize_source_ids(claim.get("source_ids"))
 
             confidence_raw = claim.get("confidence_score", 0.5)
             try:
@@ -420,47 +489,155 @@ INSTRUCTIONS REMINDER:
             claims.append(
                 {
                     "text": text,
-                    "source_ids": normalized_source_ids,
-                    "source_urls": [
-                        source_index[idx].get("url")
-                        for idx in normalized_source_ids
-                        if 0 <= idx < len(source_index)
-                    ],
+                    "source_ids": normalized_sids,
+                    "source_urls": resolve_source_urls(normalized_sids),
+                    "sources": resolve_sources(normalized_sids),
                     "confidence_score": confidence_score,
                     "confidence_label": to_str(claim.get("confidence_label"), "MEDIUM"),
                     "basis": to_str(claim.get("basis"), ""),
                 }
             )
 
+        # --- Text fields: preserve valid inline citations ---
         brief = to_str(output.get("brief"))
-        brief = _strip_inline_citations(brief)
+        brief = _normalize_inline_citations(brief, source_count)
         brief = _clean_brief(brief)
+
         executive_summary = to_str(output.get("executive_summary"), brief)
-        executive_summary = _strip_inline_citations(executive_summary)
+        executive_summary = _normalize_inline_citations(executive_summary, source_count)
         executive_summary = _clean_brief(executive_summary)
+
         one_paragraph_summary = to_str(output.get("one_paragraph_summary"))
-        one_paragraph_summary = _strip_inline_citations(one_paragraph_summary)
+        one_paragraph_summary = _normalize_inline_citations(one_paragraph_summary, source_count)
         one_paragraph_summary = _clean_brief(one_paragraph_summary)
+
+        # --- Structured sections with source_ids normalization ---
+        key_findings = []
+        for item in to_list(output.get("key_findings")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            key_findings.append(item)
+
+        key_data_points = []
+        for item in to_list(output.get("key_data_points")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            key_data_points.append(item)
+
+        timeline = []
+        for item in to_list(output.get("timeline")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            timeline.append(item)
+
+        key_tensions = []
+        for item in to_list(output.get("key_tensions")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            key_tensions.append(item)
+
+        risk_register = []
+        for item in to_list(output.get("risk_register")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            risk_register.append(item)
+
+        forward_indicators = []
+        for item in to_list(output.get("forward_indicators")):
+            if not isinstance(item, dict):
+                continue
+            item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+            forward_indicators.append(item)
+
+        contradiction_notes = []
+        for item in to_list(output.get("contradiction_notes")):
+            if isinstance(item, dict):
+                item["source_ids"] = normalize_source_ids(item.get("source_ids"))
+                contradiction_notes.append(item)
+            elif isinstance(item, str) and item.strip():
+                contradiction_notes.append({"topic": item, "source_ids": []})
 
         confidence_assessment = output.get("confidence_assessment")
         if not isinstance(confidence_assessment, dict):
             confidence_assessment = {}
 
+        suggested_follow_ups = [
+            str(item) for item in to_list(output.get("suggested_follow_ups"))
+            if isinstance(item, str) and item.strip()
+        ]
+
+        related_entities = [
+            item for item in to_list(output.get("related_entities"))
+            if isinstance(item, dict)
+        ]
+
+        methodology_note = to_str(output.get("methodology_note"), "")
+
+        source_appendix = self._source_appendix(source_index)
+
+        # --- Build rendered Markdown report ---
+        rendered_report = _render_markdown_report(
+            executive_summary=executive_summary,
+            brief=brief,
+            key_findings=key_findings,
+            key_data_points=key_data_points,
+            timeline=timeline,
+            risk_register=risk_register,
+            forward_indicators=forward_indicators,
+            key_tensions=key_tensions,
+            contradiction_notes=contradiction_notes,
+            confidence_assessment=confidence_assessment,
+            methodology_note=methodology_note,
+            suggested_follow_ups=suggested_follow_ups,
+            source_appendix=source_appendix,
+        )
+
         return {
             "status": status,
             "brief": brief,
             "one_paragraph_summary": one_paragraph_summary,
-            "key_tensions": [item for item in to_list(output.get("key_tensions")) if isinstance(item, dict)],
-            "risk_register": [item for item in to_list(output.get("risk_register")) if isinstance(item, dict)],
-            "forward_indicators": [item for item in to_list(output.get("forward_indicators")) if isinstance(item, dict)],
+            "executive_summary": executive_summary,
+            "key_findings": key_findings,
+            "key_data_points": key_data_points,
+            "timeline": timeline,
+            "key_tensions": key_tensions,
+            "risk_register": risk_register,
+            "forward_indicators": forward_indicators,
             "confidence_assessment": confidence_assessment,
             "claims": claims,
-            "executive_summary": executive_summary,
-            "key_findings": [item for item in to_list(output.get("key_findings")) if isinstance(item, dict)],
-            "risk_factors": [item for item in to_list(output.get("risk_factors")) if isinstance(item, dict)],
-            "recommendations": [str(item) for item in to_list(output.get("recommendations")) if str(item).strip()],
-            "unresolved_gaps": [str(item) for item in to_list(output.get("unresolved_gaps")) if str(item).strip()],
-            "contradiction_notes": [str(item) for item in to_list(output.get("contradiction_notes")) if str(item).strip()],
+            "contradiction_notes": contradiction_notes,
+            "suggested_follow_ups": suggested_follow_ups,
+            "related_entities": related_entities,
+            "methodology_note": methodology_note,
+            "rendered_report": rendered_report,
+            "source_appendix": source_appendix,
+        }
+
+    def _empty_synthesis_output(self, source_index: list[dict[str, Any]]) -> SynthesisOutput:
+        """Return a valid but empty synthesis output for failure cases."""
+        return {
+            "status": "FAILED",
+            "brief": "Model did not return a valid object.",
+            "one_paragraph_summary": "",
+            "executive_summary": "",
+            "key_findings": [],
+            "key_data_points": [],
+            "timeline": [],
+            "key_tensions": [],
+            "risk_register": [],
+            "forward_indicators": [],
+            "confidence_assessment": {},
+            "claims": [],
+            "contradiction_notes": [],
+            "suggested_follow_ups": [],
+            "related_entities": [],
+            "methodology_note": "",
+            "rendered_report": "",
             "source_appendix": self._source_appendix(source_index),
         }
 
@@ -477,9 +654,212 @@ INSTRUCTIONS REMINDER:
                     "provider": item.get("provider"),
                     "title": item.get("title"),
                     "date": item.get("date"),
+                    "credibility_tier": item.get("source_tier", "unknown"),
+                    "credibility_rank": item.get("credibility_rank", 0),
                 }
             )
         return appendix
+
+
+def _render_markdown_report(
+    *,
+    executive_summary: str,
+    brief: str,
+    key_findings: list[dict[str, Any]],
+    key_data_points: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+    risk_register: list[dict[str, Any]],
+    forward_indicators: list[dict[str, Any]],
+    key_tensions: list[dict[str, Any]],
+    contradiction_notes: list[dict[str, Any]],
+    confidence_assessment: dict[str, Any],
+    methodology_note: str,
+    suggested_follow_ups: list[str],
+    source_appendix: list[dict[str, Any]],
+) -> str:
+    """Render a pre-formatted Markdown research report from structured synthesis data."""
+    sections: list[str] = []
+
+    # Executive Summary
+    if executive_summary:
+        sections.append(f"## Executive Summary\n\n{executive_summary}")
+
+    # Detailed Analysis
+    if brief:
+        sections.append(f"## Detailed Analysis\n\n{brief}")
+
+    # Key Findings
+    if key_findings:
+        lines = ["## Key Findings\n"]
+        for i, finding in enumerate(key_findings, 1):
+            text = finding.get("finding", "")
+            confidence = finding.get("confidence", "")
+            sids = finding.get("source_ids", [])
+            refs = " ".join(f"[{s}]" for s in sids) if sids else ""
+            significance = finding.get("significance", "")
+            line = f"{i}. **{confidence}** {text}"
+            if refs:
+                line += f" {refs}"
+            if significance:
+                line += f"\n   *{significance}*"
+            lines.append(line)
+        sections.append("\n".join(lines))
+
+    # Key Data Points
+    if key_data_points:
+        lines = ["## Key Data Points\n"]
+        lines.append("| Metric | Value | Period | Source |")
+        lines.append("|--------|-------|--------|--------|")
+        for dp in key_data_points:
+            metric = dp.get("metric", "")
+            value = dp.get("value", "")
+            period = dp.get("period", "")
+            sids = dp.get("source_ids", [])
+            refs = ", ".join(f"[{s}]" for s in sids) if sids else ""
+            lines.append(f"| {metric} | {value} | {period} | {refs} |")
+        sections.append("\n".join(lines))
+
+    # Timeline
+    if timeline:
+        lines = ["## Timeline\n"]
+        for event in timeline:
+            date = event.get("date", "")
+            text = event.get("event", "")
+            sids = event.get("source_ids", [])
+            refs = " ".join(f"[{s}]" for s in sids) if sids else ""
+            significance = event.get("significance", "")
+            line = f"- **{date}**: {text}"
+            if refs:
+                line += f" {refs}"
+            if significance:
+                line += f"\n  *{significance}*"
+            lines.append(line)
+        sections.append("\n".join(lines))
+
+    # Risk Assessment
+    if risk_register:
+        lines = ["## Risk Assessment\n"]
+        lines.append("| Risk | Severity | Likelihood | Evidence Strength |")
+        lines.append("|------|----------|------------|-------------------|")
+        for risk in risk_register:
+            name = risk.get("risk", "")
+            severity = risk.get("severity", "")
+            likelihood = risk.get("likelihood", "")
+            strength = risk.get("evidence_strength", "")
+            lines.append(f"| {name} | {severity} | {likelihood} | {strength} |")
+        lines.append("")
+        for risk in risk_register:
+            name = risk.get("risk", "")
+            mechanism = risk.get("mechanism", "")
+            mitigating = risk.get("mitigating_factors", "")
+            sids = risk.get("source_ids", [])
+            refs = " ".join(f"[{s}]" for s in sids) if sids else ""
+            if mechanism:
+                lines.append(f"**{name}**: {mechanism} {refs}")
+                if mitigating:
+                    lines.append(f"*Mitigating factors*: {mitigating}")
+                lines.append("")
+        sections.append("\n".join(lines))
+
+    # Key Tensions
+    if key_tensions:
+        lines = ["## Key Tensions & Contradictions\n"]
+        for tension in key_tensions:
+            name = tension.get("tension", "")
+            desc = tension.get("description", "")
+            outlook = tension.get("resolution_outlook", "")
+            dims = tension.get("dimensions_involved", [])
+            dims_str = ", ".join(dims) if dims else ""
+            lines.append(f"### {name}")
+            lines.append(f"{desc}")
+            if dims_str:
+                lines.append(f"*Dimensions*: {dims_str}")
+            if outlook:
+                lines.append(f"*Resolution outlook*: {outlook}")
+            lines.append("")
+        sections.append("\n".join(lines))
+
+    # Forward Indicators
+    if forward_indicators:
+        lines = ["## Forward Indicators\n"]
+        for indicator in forward_indicators:
+            name = indicator.get("indicator", "")
+            why = indicator.get("why_it_matters", "")
+            timeframe = indicator.get("timeframe", "")
+            sids = indicator.get("source_ids", [])
+            refs = " ".join(f"[{s}]" for s in sids) if sids else ""
+            lines.append(f"- **{name}** ({timeframe}): {why} {refs}")
+        sections.append("\n".join(lines))
+
+    # Contradiction Notes
+    if contradiction_notes:
+        lines = ["## Source Contradictions\n"]
+        for note in contradiction_notes:
+            if isinstance(note, dict):
+                topic = note.get("topic", "")
+                pos_a = note.get("position_a", "")
+                pos_b = note.get("position_b", "")
+                assessment = note.get("analyst_assessment", "")
+                lines.append(f"### {topic}")
+                if pos_a:
+                    lines.append(f"- Position A: {pos_a}")
+                if pos_b:
+                    lines.append(f"- Position B: {pos_b}")
+                if assessment:
+                    lines.append(f"- *Analyst assessment*: {assessment}")
+                lines.append("")
+        sections.append("\n".join(lines))
+
+    # Confidence Assessment
+    if confidence_assessment:
+        lines = ["## Confidence Assessment\n"]
+        overall = confidence_assessment.get("overall", "")
+        rationale = confidence_assessment.get("rationale", "")
+        strongest = confidence_assessment.get("strongest_dimensions", [])
+        weakest = confidence_assessment.get("weakest_dimensions", [])
+        gaps = confidence_assessment.get("critical_gaps", [])
+        if overall:
+            lines.append(f"**Overall confidence**: {overall}")
+        if rationale:
+            lines.append(f"\n{rationale}")
+        if strongest:
+            lines.append(f"\n*Strongest dimensions*: {', '.join(strongest)}")
+        if weakest:
+            lines.append(f"*Weakest dimensions*: {', '.join(weakest)}")
+        if gaps:
+            lines.append("\n**Critical gaps**:")
+            for gap in gaps:
+                lines.append(f"- {gap}")
+        sections.append("\n".join(lines))
+
+    # Methodology
+    if methodology_note:
+        sections.append(f"## Methodology\n\n{methodology_note}")
+
+    # Suggested Follow-ups
+    if suggested_follow_ups:
+        lines = ["## Suggested Follow-up Questions\n"]
+        for i, q in enumerate(suggested_follow_ups, 1):
+            lines.append(f"{i}. {q}")
+        sections.append("\n".join(lines))
+
+    # References
+    if source_appendix:
+        lines = ["## References\n"]
+        for src in source_appendix:
+            sid = src.get("id", "")
+            title = src.get("title", "Untitled")
+            url = src.get("url", "")
+            provider = src.get("provider", "")
+            date = src.get("date", "")
+            tier = src.get("credibility_tier", "")
+            date_str = f" ({date})" if date else ""
+            provider_str = f" via {provider}" if provider else ""
+            tier_str = f" [{tier}]" if tier and tier != "unknown" else ""
+            lines.append(f"[{sid}] [{title}]({url}){date_str}{provider_str}{tier_str}")
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
 
 
 def _escape_json_control_chars(text: str) -> str:
